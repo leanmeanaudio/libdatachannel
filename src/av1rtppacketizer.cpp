@@ -63,7 +63,13 @@ std::vector<binary> AV1RtpPacketizer::extractTemporalUnitObus(const binary &data
 			return obus;
 		}
 
+		// Remember where this OBU starts so the full header is included
+		// in the extracted OBU (the extension byte is part of the header).
+		size_t obuStart = index;
+		size_t headerSize = obuHeaderSize;
+
 		if ((data.at(index) & obuHasExtensionMask) != byte(0)) {
+			headerSize++;
 			index++;
 		}
 
@@ -86,10 +92,16 @@ std::vector<binary> AV1RtpPacketizer::extractTemporalUnitObus(const binary &data
 			}
 		}
 
-		obus.emplace_back(data.begin() + index,
-		                  data.begin() + index + obuHeaderSize + leb128Size + obuLength);
+		size_t obuTotalSize = headerSize + leb128Size + obuLength;
 
-		index += obuHeaderSize + leb128Size + obuLength;
+		// Bounds check: don't read past end of data
+		if (obuStart + obuTotalSize > data.size())
+			return obus;
+
+		obus.emplace_back(data.begin() + obuStart,
+		                  data.begin() + obuStart + obuTotalSize);
+
+		index = obuStart + obuTotalSize;
 	}
 
 	return obus;
@@ -161,9 +173,20 @@ std::vector<binary> AV1RtpPacketizer::fragmentObu(const binary &data) {
 		size_t obuCount = 1;
 		size_t metadataSize = payloadHeaderSize;
 
+		// Compute the LEB128-encoded length of the sequence header
+		uint8_t seqHeaderLeb128[8] = {};
+		uint8_t seqHeaderLeb128Size = 0;
 		if (mSequenceHeader) {
 			obuCount++;
-			metadataSize += 1 + int(mSequenceHeader->size()); // 1 byte leb128
+			auto seqLen = mSequenceHeader->size();
+			do {
+				seqHeaderLeb128[seqHeaderLeb128Size] = seqLen & sevenLsbBitmask;
+				seqLen >>= 7;
+				if (seqLen > 0)
+					seqHeaderLeb128[seqHeaderLeb128Size] |= msbBitmask;
+				seqHeaderLeb128Size++;
+			} while (seqLen > 0);
+			metadataSize += seqHeaderLeb128Size + mSequenceHeader->size();
 		}
 
 		binary payload(std::min(size_t(mMaxFragmentSize), remaining + metadataSize));
@@ -174,12 +197,13 @@ std::vector<binary> AV1RtpPacketizer::fragmentObu(const binary &data) {
 		// Packetize cached SequenceHeader
 		if (obuCount == 2) {
 			payload.at(0) ^= nMask;
-			payload.at(1) = byte(mSequenceHeader->size() & sevenLsbBitmask);
-			payloadOffset += oneByteLeb128Size;
+
+			std::memcpy(payload.data() + payloadOffset, seqHeaderLeb128, seqHeaderLeb128Size);
+			payloadOffset += seqHeaderLeb128Size;
 
 			std::memcpy(payload.data() + payloadOffset, mSequenceHeader->data(),
 			            mSequenceHeader->size());
-			payloadOffset += int(mSequenceHeader->size());
+			payloadOffset += mSequenceHeader->size();
 
 			mSequenceHeader = nullptr;
 		}
