@@ -13,6 +13,7 @@
 
 #include "common.hpp"
 
+#include <array>
 #include <vector>
 
 namespace rtc {
@@ -98,7 +99,7 @@ struct RTC_CPP_EXPORT RtcpReportBlock {
 	[[nodiscard]] uint32_t delaySinceSR() const;
 
 	[[nodiscard]] SSRC getSSRC() const;
-	[[nodiscard]] uint32_t getNTPOfSR() const;
+	[[nodiscard]] uint64_t getNTPOfSR() const;
 	[[nodiscard]] uint8_t getFractionLost() const;
 	[[nodiscard]] unsigned int getPacketsLostCount() const;
 
@@ -269,7 +270,7 @@ struct RTC_CPP_EXPORT RtcpRemb {
 
 	char _id[4];       // Unique identifier ('R' 'E' 'M' 'B')
 	uint32_t _bitrate; // Num SSRC, Br Exp, Br Mantissa (bit mask)
-	SSRC _ssrc[1];
+	SSRC _ssrcs[1];
 
 	[[nodiscard]] static size_t SizeWithSSRCs(int count);
 
@@ -277,8 +278,16 @@ struct RTC_CPP_EXPORT RtcpRemb {
 
 	void preparePacket(SSRC senderSSRC, unsigned int numSSRC, unsigned int in_bitrate);
 	void setBitrate(unsigned int numSSRC, unsigned int in_bitrate);
-	void setSsrc(int iterator, SSRC newSssrc);
-	unsigned int getNumSSRC();
+	SSRC getSSRC(int num) const;
+	void setSSRC(int num, SSRC newSsrc);
+	bool hasValidId() const;
+	int getSSRCCount() const;
+	unsigned int getBitrate() const;
+
+	// Deprecated
+	[[deprecated("use setSSRC")]] void setSsrc(int num, SSRC newSsrc);
+	[[deprecated("use getSSRCCount")]] unsigned int getNumSSRC() const;
+	[[deprecated("use getSSRCCount")]] unsigned int getNumSSRC();
 	unsigned int getBitrate();
 };
 
@@ -292,20 +301,27 @@ struct RTC_CPP_EXPORT RtcpPli {
 	void log() const;
 };
 
-struct RTC_CPP_EXPORT RtcpFirPart {
-	uint32_t ssrc;
-	uint8_t seqNo;
-	uint8_t dummy1;
-	uint16_t dummy2;
+struct RTC_CPP_EXPORT RtcpFirFci {
+	uint32_t _ssrc;
+	uint8_t _seqNo;
+	uint8_t _dummy1;
+	uint16_t _dummy2;
+
+	void preparePacket(SSRC ssrc, uint8_t seqNo);
+
+	[[nodiscard]] SSRC getSSRC() const;
+	[[nodiscard]] uint8_t getSeqNo() const;
 };
 
 struct RTC_CPP_EXPORT RtcpFir {
 	RtcpFbHeader header;
-	RtcpFirPart parts[1];
+	RtcpFirFci _fcis[1];
 
-	static unsigned int Size();
+	[[nodiscard]] static size_t SizeWithFcis(int count);
 
-	void preparePacket(SSRC messageSSRC, uint8_t seqNo);
+	int getFciCount() const;
+	[[nodiscard]] const RtcpFirFci *getFci(int num) const; // nullptr if out-of-bounds
+	void preparePacket(SSRC senderSSRC, const std::vector<RtcpFirFci> &fcis);
 
 	void log() const;
 };
@@ -343,6 +359,30 @@ struct RTC_CPP_EXPORT RtcpNack {
 	 * @return true if the packet has grown, false otherwise.
 	 */
 	bool addMissingPacket(unsigned int *fciCount, uint16_t *fciPID, uint16_t missingPacket);
+};
+
+typedef std::array<char, 4> RtcpAppName;
+
+struct RTC_CPP_EXPORT RtcpApp {
+	RtcpHeader header;
+
+	SSRC _ssrc;
+	char _name[4];
+	char _data[1];
+
+	[[nodiscard]] static size_t SizeWithData(size_t dataLength);
+
+	[[nodiscard]] SSRC ssrc() const;
+	[[nodiscard]] uint8_t subtype() const;
+	[[nodiscard]] RtcpAppName name() const;
+	[[nodiscard]] const char *data() const;
+	[[nodiscard]] size_t dataSize() const;
+
+	void preparePacket(SSRC ssrc, const RtcpAppName &name, uint8_t subtype, size_t dataLength);
+	void setSSRC(SSRC ssrc);
+	void setName(const RtcpAppName &name);
+
+	void log() const;
 };
 
 struct RTC_CPP_EXPORT RtpRtx {

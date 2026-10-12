@@ -13,6 +13,7 @@
 #include "impl/utils.hpp"
 
 #include <algorithm>
+#include <numeric>
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -55,6 +56,33 @@ inline std::pair<string_view, string_view> parse_pair(string_view attr) {
 		key = attr;
 	}
 	return std::make_pair(std::move(key), std::move(value));
+}
+
+inline std::vector<std::pair<string, string>> parse_attr_list(const string& attr_list) {
+	std::vector<std::pair<string, string>> attrs;
+
+	size_t pos = 0;
+	size_t end = attr_list.size();
+	while (pos < end) {
+		auto i = attr_list.find(';', pos);
+		if (i == string_view::npos) {
+			i = end;
+		}
+
+		const auto key_value = attr_list.substr(pos, i - pos);
+		const auto j = key_value.find('=');
+		if (j != string_view::npos) {
+			const auto key = key_value.substr(0, j);
+			const auto value = key_value.substr(j + 1);
+			if (!key.empty() && !value.empty()) {
+				attrs.emplace_back(key, value);
+			}
+		}
+
+		pos = i + 1;
+	}
+
+	return attrs;
 }
 
 template <typename T> T to_integer(string_view s) {
@@ -157,7 +185,7 @@ Description::Description(const string &sdp, Type type, Role role)
 				// RFC 8839: The "ice-options" attribute is a session-level and media-level
 				// attribute.
 				if (mIceOptions.empty())
-					mIceOptions = utils::explode(string(value), ',');
+					mIceOptions = utils::explode(string(value), ' ');
 			} else if (key == "candidate") {
 				addCandidate(Candidate(attr, bundleMid()));
 			} else if (key == "end-of-candidates") {
@@ -289,6 +317,7 @@ Description::operator string() const { return generateSdp("\r\n"); }
 
 string Description::generateSdp(string_view eol) const {
 	std::ostringstream sdp;
+	sdp.imbue(std::locale::classic());
 
 	// Header
 	sdp << "v=0" << eol;
@@ -299,6 +328,7 @@ string Description::generateSdp(string_view eol) const {
 	// BUNDLE (RFC 8843 Negotiating Media Multiplexing Using the Session Description Protocol)
 	// https://www.rfc-editor.org/rfc/rfc8843.html
 	std::ostringstream bundleGroup;
+	bundleGroup.imbue(std::locale::classic());
 	for (const auto &entry : mEntries)
 		if (!entry->isRemoved())
 			bundleGroup << ' ' << entry->mid();
@@ -308,6 +338,7 @@ string Description::generateSdp(string_view eol) const {
 
 	// Lip-sync
 	std::ostringstream lsGroup;
+	lsGroup.imbue(std::locale::classic());
 	for (const auto &entry : mEntries)
 		if (!entry->isRemoved() && entry != mApplication)
 			lsGroup << ' ' << entry->mid();
@@ -318,7 +349,7 @@ string Description::generateSdp(string_view eol) const {
 	// Session-level attributes
 	sdp << "a=msid-semantic:WMS *" << eol;
 	if (!mIceOptions.empty())
-		sdp << "a=ice-options:" << utils::implode(mIceOptions, ',') << eol;
+		sdp << "a=ice-options:" << utils::implode(mIceOptions, ' ') << eol;
 	if (mFingerprint)
 		sdp << "a=fingerprint:"
 		    << CertificateFingerprint::AlgorithmIdentifier(mFingerprint->algorithm) << " "
@@ -363,6 +394,7 @@ string Description::generateSdp(string_view eol) const {
 
 string Description::generateApplicationSdp(string_view eol) const {
 	std::ostringstream sdp;
+	sdp.imbue(std::locale::classic());
 
 	// Header
 	sdp << "v=0" << eol;
@@ -381,7 +413,7 @@ string Description::generateApplicationSdp(string_view eol) const {
 	// Session-level attributes
 	sdp << "a=msid-semantic:WMS *" << eol;
 	if (!mIceOptions.empty())
-		sdp << "a=ice-options:" << utils::implode(mIceOptions, ',') << eol;
+		sdp << "a=ice-options:" << utils::implode(mIceOptions, ' ') << eol;
 
 	for (const auto &attr : mAttributes)
 		sdp << "a=" << attr << eol;
@@ -449,6 +481,60 @@ void Description::removeApplication() {
 		mEntries.erase(it);
 
 	mApplication.reset();
+}
+
+static std::vector<int> availablePayloadTypes(const Description::Media *media) {
+	std::vector<int> allPt(32);
+	std::iota(allPt.begin(), allPt.end(), 96);
+	auto usedPt = media->payloadTypes();
+	std::sort(usedPt.begin(), usedPt.end());
+	std::vector<int> availablePt;
+	std::set_difference(allPt.begin(), allPt.end(), usedPt.begin(), usedPt.end(),
+	                    std::back_inserter(availablePt));
+	return availablePt;
+}
+
+void Description::addRtx(optional<unsigned int> clockRate, bool audio) {
+	for (int i = 0; i < mediaCount(); ++i) {
+		if (!std::holds_alternative<Media *>(media(i)))
+		    continue;
+
+		Media *med = std::get<Media*>(media(i));
+
+		// Apply to video always. Apply to audio only if requested
+		string mediaType = med->type();
+		if (mediaType == "audio" && !audio)
+			continue;
+		if (mediaType != "audio" && mediaType != "video")
+			continue;
+
+		// Collect non-RTX codecs that don't already have an RTX entry
+		std::vector<int> codecsNeedingRtx;
+		for (int pt : med->payloadTypes()) {
+			auto *rtp = med->rtpMap(pt);
+			if (rtp->format == "RTX" || rtp->format == "rtx")
+				continue;
+			if (med->getRtxPayloadType(pt).has_value())
+				continue;
+			codecsNeedingRtx.push_back(pt);
+		}
+
+		// Find available dynamic payload types via set difference
+		auto availablePt = availablePayloadTypes(med);
+		std::reverse(availablePt.begin(), availablePt.end());
+
+		for (int origPt : codecsNeedingRtx) {
+			if (availablePt.empty())
+				break;
+
+			int rtxPt = availablePt.back();
+			availablePt.pop_back();
+
+			auto *rtp = med->rtpMap(origPt);
+			unsigned int rate = clockRate.value_or(rtp->clockRate);
+			med->addRtxCodec(rtxPt, origPt, rate);
+		}
+	}
 }
 
 bool Description::hasApplication() const { return mApplication && !mApplication->isRemoved(); }
@@ -546,6 +632,66 @@ int Description::mediaCount() const { return int(mEntries.size()); }
 
 string Description::sessionId() const { return mSessionId; }
 
+Description::RidAttribute::RidAttribute(string name, string value) : mName(std::move(name)), mValue(std::move(value)) {}
+
+const string &Description::RidAttribute::name() const {
+	return mName;
+}
+
+const string &Description::RidAttribute::value() const {
+	return mValue;
+}
+
+void Description::RidAttribute::value(string value) {
+	mValue = std::move(value);
+}
+
+Description::Rid::Rid(string rid) : mRid(std::move(rid)) {}
+
+Description::Rid::Rid(string rid, std::vector<RidAttribute> attributes) : mRid(std::move(rid)), mAttributes(std::move(attributes)) {}
+
+const string &Description::Rid::rid() const { return mRid; }
+
+const std::vector<Description::RidAttribute> &Description::Rid::attributes() const { return mAttributes; }
+
+Description::RidBuilder::RidBuilder(string rid) : mRid(std::move(rid)) {}
+
+Description::RidBuilder& Description::RidBuilder::max_width(uint32_t value) {
+	return saveAttribute("max-width", std::to_string(value));
+}
+
+Description::RidBuilder& Description::RidBuilder::max_height(uint32_t value) {
+	return saveAttribute("max-height", std::to_string(value));
+}
+
+Description::RidBuilder& Description::RidBuilder::max_fps(uint32_t value) {
+	return saveAttribute("max-fps", std::to_string(value));
+}
+
+Description::RidBuilder& Description::RidBuilder::max_br(uint32_t value) {
+	return saveAttribute("max-br", std::to_string(value));
+}
+
+Description::RidBuilder& Description::RidBuilder::custom(string key, string value) {
+	return saveAttribute(std::move(key), std::move(value));
+}
+
+Description::Rid Description::RidBuilder::build() {
+	return {std::move(mRid), std::move(mAttributes)};
+}
+
+Description::RidBuilder& Description::RidBuilder::saveAttribute(string key, string value) {
+	const auto iter = std::find_if(mAttributes.begin(), mAttributes.end(),
+		[&key](const RidAttribute &attr) { return attr.name() == key; }
+	);
+	if (iter != mAttributes.end()) {
+		iter->value(std::move(value));
+	} else {
+		mAttributes.emplace_back(std::move(key), std::move(value));
+	}
+	return *this;
+}
+
 Description::Entry::Entry(const string &mline, string mid, Direction dir)
     : mMid(std::move(mid)), mDirection(dir) {
 
@@ -591,7 +737,17 @@ void Description::addAttribute(string attr) {
 		mAttributes.emplace_back(std::move(attr));
 }
 
-void Description::Entry::addRid(string rid) { mRids.emplace_back(rid); }
+void Description::Entry::addRid(string rid) {
+	mRids.emplace_back(std::move(rid));
+}
+
+void Description::Entry::addRid(Rid rid) {
+	mRids.emplace_back(std::move(rid));
+}
+
+std::vector<Description::Rid> Description::Entry::rids() const {
+	return mRids;
+}
 
 void Description::removeAttribute(const string &attr) {
 	mAttributes.erase(
@@ -600,7 +756,7 @@ void Description::removeAttribute(const string &attr) {
 	    mAttributes.end());
 }
 
-std::vector<int> Description::Entry::extIds() {
+std::vector<int> Description::Entry::extIds() const {
 	std::vector<int> result;
 	for (auto it = mExtMaps.begin(); it != mExtMaps.end(); ++it)
 		result.push_back(it->first);
@@ -635,6 +791,7 @@ Description::Entry::operator string() const { return generateSdp("\r\n", "IP4 0.
 
 string Description::Entry::generateSdp(string_view eol, string_view addr, uint16_t port) const {
 	std::ostringstream sdp;
+	sdp.imbue(std::locale::classic());
 	// RFC 3264: Existing media streams are removed by creating a new SDP with the port number for
 	// that stream set to zero. [...] A stream that is offered with a port of zero MUST be marked
 	// with port zero in the answer.
@@ -648,6 +805,7 @@ string Description::Entry::generateSdp(string_view eol, string_view addr, uint16
 
 string Description::Entry::generateSdpLines(string_view eol) const {
 	std::ostringstream sdp;
+	sdp.imbue(std::locale::classic());
 	sdp << "a=mid:" << mMid << eol;
 
 	for (auto it = mExtMaps.begin(); it != mExtMaps.end(); ++it) {
@@ -667,7 +825,15 @@ string Description::Entry::generateSdpLines(string_view eol) const {
 	if (mDirection != Direction::Unknown)
 		sdp << "a=" << mDirection << eol;
 
+	// Do not reciprocate unknown transport attributes
+	const std::array ignoredPrefixes{"ice-", "dtls-", "sctp-"};
+
 	for (const auto &attr : mAttributes) {
+		if (std::any_of(ignoredPrefixes.begin(), ignoredPrefixes.end(),
+		                [&](string_view prefix) { return match_prefix(attr, prefix); })) {
+			continue;
+		}
+
 		if (mRids.size() != 0 && match_prefix(attr, "ssrc:")) {
 			continue;
 		}
@@ -676,10 +842,27 @@ string Description::Entry::generateSdpLines(string_view eol) const {
 	}
 
 	for (const auto &rid : mRids) {
-		sdp << "a=rid:" << rid << " send" << eol;
+		sdp << "a=rid:" << rid.rid() << " send";
+
+		const auto &attributes = rid.attributes();
+		if (!attributes.empty()) {
+			sdp << " ";
+
+			bool first = true;
+			for (const auto &attr : attributes) {
+				if (first) {
+					first = false;
+				} else {
+					sdp << ";";
+				}
+				sdp << attr.name() << "=" << attr.value();
+			}
+		}
+
+		sdp << eol;
 	}
 
-	if (mRids.size() != 0) {
+	if (!mRids.empty()) {
 		sdp << "a=simulcast:send ";
 
 		bool first = true;
@@ -690,7 +873,7 @@ string Description::Entry::generateSdpLines(string_view eol) const {
 				sdp << ";";
 			}
 
-			sdp << rid;
+			sdp << rid.rid();
 		}
 
 		sdp << eol;
@@ -727,6 +910,39 @@ void Description::Entry::parseSdpLine(string_view line) {
 			// a bundled "m=" section from a BUNDLE group, the offerer [...] MUST NOT assign an SDP
 			// 'bundle-only' attribute to the "m=" section.
 			mIsRemoved = false;
+		} else if (key == "rid") {
+			// "a:rid=foo send" or optionally "a:rid=foo send abc=def;x=y;m=n"
+			const auto list = utils::explode(string(value), ' ');
+			if (list.size() < 2) {
+				throw std::invalid_argument("Invalid rid line \"" + string(line) + "\" in description");
+			}
+
+			const auto& rid = list[0];
+			const auto& direction = list[1];
+
+			auto builder = RidBuilder(rid);
+
+			if (list.size() >= 3) {
+				const auto attr_list_parsed = parse_attr_list(list[2]);
+				for (const auto& [attr_key, attr_value] : attr_list_parsed) {
+					if (attr_key == "max-width") {
+						builder.max_width(to_integer<uint32_t>(attr_value));
+					} else if (attr_key == "max-height") {
+						builder.max_height(to_integer<uint32_t>(attr_value));
+					} else if (attr_key == "max-br") {
+						builder.max_br(to_integer<uint32_t>(attr_value));
+					} else if (attr_key == "max-fps") {
+						builder.max_fps(to_integer<uint32_t>(attr_value));
+					} else {
+						builder.custom(attr_key, attr_value);
+					}
+				}
+			}
+
+			// TODO - we don't store direction anywhere for now
+			(void) direction;
+
+			addRid(builder.build());
 		} else {
 			mAttributes.emplace_back(attr);
 		}
@@ -830,6 +1046,7 @@ void Description::Media::clearSSRCs() {
 
 	mSsrcs.clear();
 	mCNameMap.clear();
+	mSsrcToRtxSsrc.clear();
 }
 
 std::vector<uint32_t> Description::Media::getSSRCs() const { return mSsrcs; }
@@ -838,6 +1055,53 @@ optional<string> Description::Media::getCNameForSsrc(uint32_t ssrc) const {
 	auto it = mCNameMap.find(ssrc);
 	if (it != mCNameMap.end()) {
 		return it->second;
+	}
+	return nullopt;
+}
+
+void Description::Media::addRtxSSRC(SSRC primarySsrc, SSRC rtxSsrc, optional<string> cname) {
+	mSsrcToRtxSsrc[primarySsrc] = rtxSsrc;
+
+	// Add the RTX SSRC to mSsrcs if not already present
+	if (!hasSSRC(rtxSsrc)) {
+		if (cname) {
+			std::ostringstream attr;
+			attr.imbue(std::locale::classic());
+			attr << "ssrc:" << rtxSsrc << " cname:" << *cname;
+			mAttributes.emplace_back(attr.str());
+			mCNameMap.emplace(rtxSsrc, *cname);
+		} else {
+			std::ostringstream attr;
+			attr.imbue(std::locale::classic());
+			attr << "ssrc:" << rtxSsrc;
+			mAttributes.emplace_back(attr.str());
+		}
+		mSsrcs.emplace_back(rtxSsrc);
+	}
+}
+
+void Description::Media::removeRtxSSRC(SSRC primarySsrc) {
+	auto it = mSsrcToRtxSsrc.find(primarySsrc);
+	if (it != mSsrcToRtxSsrc.end()) {
+		SSRC rtxSsrc = it->second;
+		removeSSRC(rtxSsrc);
+		mSsrcToRtxSsrc.erase(it);
+	}
+}
+
+optional<SSRC> Description::Media::getRtxSsrcForSsrc(SSRC primarySsrc) const {
+	auto it = mSsrcToRtxSsrc.find(primarySsrc);
+	if (it != mSsrcToRtxSsrc.end()) {
+		return it->second;
+	}
+	return nullopt;
+}
+
+optional<SSRC> Description::Media::getSsrcForRtxSsrc(SSRC rtxSsrc) const {
+	for (const auto &[primary, rtx] : mSsrcToRtxSsrc) {
+		if (rtx == rtxSsrc) {
+			return primary;
+		}
 	}
 	return nullopt;
 }
@@ -869,6 +1133,7 @@ optional<size_t> Description::Application::maxMessageSize() const { return mMaxM
 
 string Description::Application::generateSdpLines(string_view eol) const {
 	std::ostringstream sdp;
+	sdp.imbue(std::locale::classic());
 	sdp << Entry::generateSdpLines(eol);
 
 	if (mSctpPort)
@@ -924,6 +1189,7 @@ Description::Media::Media(const string &sdp) : Media(get_first_line(sdp), "", Di
 
 string Description::Media::description() const {
 	std::ostringstream ss;
+	ss.imbue(std::locale::classic());
 	for (auto it = mOrderedPayloadTypes.begin(); it != mOrderedPayloadTypes.end(); ++it) {
 		if (it != mOrderedPayloadTypes.begin())
 			ss << ' ';
@@ -1044,19 +1310,74 @@ void Description::Media::removeFormat(const string &format) {
 		removeRtpMap(pt);
 }
 
+void Description::Media::addFeedback(string fb) {
+	if (std::find(mRtcpFbs.begin(), mRtcpFbs.end(), fb) == mRtcpFbs.end())
+		mRtcpFbs.emplace_back(std::move(fb));
+}
+
+void Description::Media::removeFeedback(const string &str) {
+	auto it = mRtcpFbs.begin();
+	while (it != mRtcpFbs.end()) {
+		if (it->find(str) != string::npos)
+			it = mRtcpFbs.erase(it);
+		else
+			it++;
+	}
+}
+
+bool Description::Media::hasFeedback(const string &str) const {
+	for (const auto &fb : mRtcpFbs)
+		if (fb.find(str) != string::npos)
+			return true;
+
+	return false;
+}
+
 void Description::Media::addRtxCodec(int payloadType, int origPayloadType, unsigned int clockRate) {
-	RtpMap rtp(std::to_string(payloadType) + " RTX/" + std::to_string(clockRate));
+	RtpMap rtp(std::to_string(payloadType) + " rtx/" + std::to_string(clockRate));
 	rtp.fmtps.emplace_back("apt=" + std::to_string(origPayloadType));
 	addRtpMap(rtp);
 }
 
+optional<int> Description::Media::getRtxPayloadType(int primaryPayloadType) const {
+	string aptValue = "apt=" + std::to_string(primaryPayloadType);
+	for (const auto &[pt, map] : mRtpMaps) {
+		for (const auto &fmtp : map.fmtps) {
+			if (fmtp == aptValue)
+				return pt;
+		}
+	}
+	return nullopt;
+}
+
+bool Description::Media::isRtxEnabled() const {
+	for (const auto &[pt, map] : mRtpMaps) {
+		if (map.format == "RTX" || map.format == "rtx")
+			return true;
+	}
+	return false;
+}
+
+void Description::Media::disableRtx() {
+	removeFormat("RTX");
+	removeFormat("rtx");
+	auto mSsrcToRtxSsrcCopy = mSsrcToRtxSsrc;
+	for (const auto &[primarySsrc, _] : mSsrcToRtxSsrcCopy)
+		removeRtxSSRC(primarySsrc);
+	mSsrcToRtxSsrc.clear();
+}
+
 string Description::Media::generateSdpLines(string_view eol) const {
 	std::ostringstream sdp;
+	sdp.imbue(std::locale::classic());
 	if (mBas >= 0)
 		sdp << "b=AS:" << mBas << eol;
 
 	sdp << Entry::generateSdpLines(eol);
 	sdp << "a=rtcp-mux" << eol;
+
+	for (const auto &fb : mRtcpFbs)
+		sdp << "a=rtcp-fb:* " << fb << eol;
 
 	for (auto it = mRtpMaps.begin(); it != mRtpMaps.end(); ++it) {
 		auto &map = it->second;
@@ -1073,6 +1394,11 @@ string Description::Media::generateSdpLines(string_view eol) const {
 
 		for (const auto &val : map.fmtps)
 			sdp << "a=fmtp:" << map.payloadType << ' ' << val << eol;
+	}
+
+	// Output ssrc-group:FID for RTX SSRC associations
+	for (const auto &[primarySsrc, rtxSsrc] : mSsrcToRtxSsrc) {
+		sdp << "a=ssrc-group:FID " << primarySsrc << ' ' << rtxSsrc << eol;
 	}
 
 	return sdp.str();
@@ -1093,12 +1419,19 @@ void Description::Media::parseSdpLine(string_view line) {
 
 		} else if (key == "rtcp-fb") {
 			size_t p = value.find(' ');
-			int pt = to_integer<int>(value.substr(0, p));
-			auto it = mRtpMaps.find(pt);
-			if (it == mRtpMaps.end())
-				it = mRtpMaps.insert(std::make_pair(pt, Description::Media::RtpMap(pt))).first;
+			auto ptStr = value.substr(0, p);
+			auto fbValue = string(value.substr(p + 1));
 
-			it->second.rtcpFbs.emplace_back(value.substr(p + 1));
+			if (ptStr == "*") {
+				addFeedback(std::move(fbValue));
+			} else {
+				int pt = to_integer<int>(ptStr);
+				auto it = mRtpMaps.find(pt);
+				if (it == mRtpMaps.end())
+					it = mRtpMaps.insert(std::make_pair(pt, Description::Media::RtpMap(pt))).first;
+
+				it->second.rtcpFbs.emplace_back(std::move(fbValue));
+			}
 
 		} else if (key == "fmtp") {
 			size_t p = value.find(' ');
@@ -1123,6 +1456,18 @@ void Description::Media::parseSdpLine(string_view line) {
 				mCNameMap.emplace(ssrc, cname);
 			}
 			mAttributes.emplace_back(attr);
+
+		} else if (key == "ssrc-group") {
+			// Parse ssrc-group:FID <primary> <rtx>
+			if (match_prefix(value, "FID ")) {
+				string_view ssrcs = value.substr(4);
+				size_t space = ssrcs.find(' ');
+				if (space != string_view::npos) {
+					auto primarySsrc = to_integer<SSRC>(ssrcs.substr(0, space));
+					auto rtxSsrc = to_integer<SSRC>(ssrcs.substr(space + 1));
+					mSsrcToRtxSsrc[primarySsrc] = rtxSsrc;
+				}
+			}
 
 		} else {
 			Entry::parseSdpLine(line);
@@ -1187,6 +1532,17 @@ void Description::Media::RtpMap::removeFeedback(const string &str) {
 		else
 			it++;
 	}
+}
+
+bool Description::Media::RtpMap::hasFeedback(const string &str) const {
+	auto it = rtcpFbs.begin();
+	while (it != rtcpFbs.end()) {
+		if (it->find(str) != string::npos)
+			return true;
+		else
+			it++;
+	}
+	return false;
 }
 
 void Description::Media::RtpMap::addParameter(string p) {
@@ -1254,7 +1610,7 @@ void Description::Video::addVideoCodec(int payloadType, string codec, optional<s
 
 	map.addFeedback("nack");
 	map.addFeedback("nack pli");
-	// map.addFB("ccm fir");
+	map.addFeedback("ccm fir");
 	map.addFeedback("goog-remb");
 
 	if (profile)

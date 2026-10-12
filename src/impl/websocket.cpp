@@ -68,7 +68,7 @@ WebSocket::WebSocket(optional<Configuration> optConfig, certificate_ptr certific
 
 WebSocket::~WebSocket() { PLOG_VERBOSE << "Destroying WebSocket"; }
 
-void WebSocket::open(const string &url) {
+void WebSocket::open(const string &url, const rtc::WebSocket::Headers &headers) {
 	PLOG_VERBOSE << "Opening WebSocket to URL: " << url;
 
 	if (state != State::Closed)
@@ -78,7 +78,7 @@ void WebSocket::open(const string &url) {
 	static const char *rs =
 	    R"(^(([^:.@/?#]+):)?(/{0,2}((([^:@]*)(:([^@]*))?)@)?(([^:/?#]*)(:([^/?#]*))?))?([^?#]*)(\?([^#]*))?(#(.*))?)";
 
-	static const std::regex r(rs, std::regex::extended);
+	static const std::regex r(rs);
 
 	std::smatch m;
 	if (!std::regex_match(url, m, r) || m[10].length() == 0)
@@ -126,7 +126,8 @@ void WebSocket::open(const string &url) {
 
 	mHostname = hostname; // for TLS SNI and Proxy
 	mService = service;   // For proxy
-	std::atomic_store(&mWsHandshake, std::make_shared<WsHandshake>(host, path, config.protocols));
+	std::atomic_store(&mWsHandshake,
+	                  std::make_shared<WsHandshake>(host, path, config.protocols, headers));
 
 	changeState(State::Connecting);
 
@@ -185,7 +186,7 @@ bool WebSocket::outgoing(message_ptr message) {
 	if (message->size() > maxMessageSize())
 		throw std::runtime_error("Message size exceeds limit");
 
-	return mWsTransport->send(message);
+	return mWsTransport->send(std::move(message));
 }
 
 void WebSocket::incoming(message_ptr message) {
@@ -195,7 +196,7 @@ void WebSocket::incoming(message_ptr message) {
 	}
 
 	if (message->type == Message::String || message->type == Message::Binary) {
-		mRecvQueue.push(message);
+		mRecvQueue.push(std::move(message));
 		triggerAvailable(mRecvQueue.size());
 	}
 }
@@ -235,7 +236,7 @@ shared_ptr<TcpTransport> WebSocket::setTcpTransport(shared_ptr<TcpTransport> tra
 		transport->onBufferedAmount(weak_bind(&WebSocket::triggerBufferedAmount, this, _1));
 
 		transport->onStateChange([this, weak_this = weak_from_this()](State transportState) {
-			if(auto locked = weak_this.lock())
+			if (auto locked = weak_this.lock())
 				std::invoke([=]() {
 					switch (transportState) {
 					case State::Connected:
@@ -251,7 +252,7 @@ shared_ptr<TcpTransport> WebSocket::setTcpTransport(shared_ptr<TcpTransport> tra
 						remoteClose();
 						break;
 					case State::Disconnected:
-						if(state == WebSocket::State::Connecting)
+						if (state == WebSocket::State::Connecting)
 							remoteClose();
 						break;
 					default:
@@ -265,6 +266,11 @@ shared_ptr<TcpTransport> WebSocket::setTcpTransport(shared_ptr<TcpTransport> tra
 		auto pingInterval = config.pingInterval.value_or(10000ms);
 		if (pingInterval > milliseconds::zero())
 			transport->setReadTimeout(pingInterval);
+
+		// Set TCP connect timeout if specified
+		auto connectTimeout = config.tcpConnectionTimeout.value_or(5000ms);
+		if (connectTimeout > milliseconds::zero())
+			transport->setConnectTimeout(connectTimeout);
 
 		scheduleConnectionTimeout();
 
@@ -289,7 +295,7 @@ shared_ptr<HttpProxyTransport> WebSocket::initProxyTransport() {
 			throw std::logic_error("No underlying TCP transport for Proxy transport");
 
 		auto stateChangeCallback = [this, weak_this = weak_from_this()](State transportState) {
-			if(auto locked = weak_this.lock())
+			if (auto locked = weak_this.lock())
 				std::invoke([=]() {
 					switch (transportState) {
 					case State::Connected:
@@ -303,7 +309,7 @@ shared_ptr<HttpProxyTransport> WebSocket::initProxyTransport() {
 						remoteClose();
 						break;
 					case State::Disconnected:
-						if(state == WebSocket::State::Connecting)
+						if (state == WebSocket::State::Connecting)
 							remoteClose();
 						break;
 					default:
@@ -348,7 +354,7 @@ shared_ptr<TlsTransport> WebSocket::initTlsTransport() {
 		}
 
 		auto stateChangeCallback = [this, weak_this = weak_from_this()](State transportState) {
-			if(auto locked = weak_this.lock())
+			if (auto locked = weak_this.lock())
 				std::invoke([=]() {
 					switch (transportState) {
 					case State::Connected:
@@ -359,7 +365,7 @@ shared_ptr<TlsTransport> WebSocket::initTlsTransport() {
 						remoteClose();
 						break;
 					case State::Disconnected:
-						if(state == WebSocket::State::Connecting)
+						if (state == WebSocket::State::Connecting)
 							remoteClose();
 						break;
 					default:
@@ -428,7 +434,7 @@ shared_ptr<WsTransport> WebSocket::initWsTransport() {
 			atomic_store(&mWsHandshake, std::make_shared<WsHandshake>());
 
 		auto stateChangeCallback = [this, weak_this = weak_from_this()](State transportState) {
-			if(auto locked = weak_this.lock())
+			if (auto locked = weak_this.lock())
 				std::invoke([=]() {
 					switch (transportState) {
 					case State::Connected:

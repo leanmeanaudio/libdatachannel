@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2024 Paul-Louis Ageneau
+ * Copyright (c) 2026 Henry Ruhs
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -13,53 +13,93 @@
 
 namespace rtc {
 
-/*
- * AV1 RTP payload format — aggregation header
- * See https://aomediacodec.github.io/av1-rtp-spec/#44-av1-aggregation-header
- *
- *  0 1 2 3 4 5 6 7
- * +-+-+-+-+-+-+-+-+
- * |Z|Y| W |N|-|-|-|
- * +-+-+-+-+-+-+-+-+
- *
- * Z: 1 if the first OBU element is a continuation of a fragment from the
- *    previous packet.
- * Y: 1 if the last OBU element will continue in the next packet.
- * W: Number of OBU elements in the packet (0 means each element is
- *    preceded by a length field; 1–3 means the last element has no
- *    length field and its size is inferred).
- * N: 1 if this is the first packet of a coded video sequence.
- */
+const auto obuHeaderSize = 1;
+const auto obuHasExtensionMask = byte(0b00000100);
+const auto obuHasSizeMask = byte(0b00000010);
 
-const uint8_t zMask = 0b10000000;
-const uint8_t yMask = 0b01000000;
-const uint8_t wMask = 0b00110000;
-const int     wShift = 4;
+const auto zMask = byte(0b10000000);
+const auto yMask = byte(0b01000000);
+const auto wMask = byte(0b00110000);
+const auto wBitshift = 4;
 
-const uint8_t sevenLsbBitmask = 0b01111111;
-const uint8_t msbBitmask = 0b10000000;
+const auto sevenLsbBitmask = byte(0b01111111);
+const auto msbBitmask = byte(0b10000000);
 
-// Read a LEB128-encoded unsigned integer from data at offset.
-// Returns the decoded value and advances offset past the encoded bytes.
-static uint32_t readLeb128(const std::byte *data, size_t size, size_t &offset) {
-	uint32_t value = 0;
-	for (int i = 0; i < 8; i++) {
-		if (offset >= size)
-			break;
-		auto b = std::to_integer<uint8_t>(data[offset]);
-		value |= static_cast<uint32_t>(b & sevenLsbBitmask) << (i * 7);
-		offset++;
-		if (!(b & msbBitmask))
-			break;
+namespace {
+
+void appendObuWithSize(binary &frame, const byte *data, size_t size) {
+	if (size < 1)
+		return;
+
+	byte header = data[0];
+	bool hasExtension = (header & obuHasExtensionMask) != byte(0);
+	bool hasSizeField = (header & obuHasSizeMask) != byte(0);
+	size_t headerSize = obuHeaderSize + (hasExtension ? 1 : 0);
+
+	if (size < headerSize)
+		return;
+
+	const byte *payloadData;
+	size_t payloadSize;
+
+	if (hasSizeField) {
+		size_t offset = headerSize;
+		uint32_t existingSize = 0;
+		for (int i = 0; i < 4 && offset < size; i++) {
+			byte b = data[offset++];
+			existingSize |= std::to_integer<uint32_t>(b & sevenLsbBitmask) << (i * 7);
+			if ((b & msbBitmask) == byte(0))
+				break;
+		}
+		payloadData = data + offset;
+		payloadSize = size - offset;
+		if (existingSize < payloadSize)
+			payloadSize = existingSize;
+	} else {
+		payloadData = data + headerSize;
+		payloadSize = size - headerSize;
 	}
-	return value;
+
+	frame.push_back(header | obuHasSizeMask);
+
+	if (hasExtension)
+		frame.push_back(data[1]);
+
+	uint32_t remaining = static_cast<uint32_t>(payloadSize);
+	do {
+		byte b = byte(remaining) & sevenLsbBitmask;
+		remaining >>= 7;
+		if (remaining > 0)
+			b |= msbBitmask;
+		frame.push_back(b);
+	} while (remaining > 0);
+
+	frame.insert(frame.end(), payloadData, payloadData + payloadSize);
 }
 
-AV1RtpDepacketizer::AV1RtpDepacketizer() {}
+} // anonymous namespace
+
+AV1RtpDepacketizer::AV1RtpDepacketizer(Packetization packetization)
+    : mPacketization(packetization) {}
 
 AV1RtpDepacketizer::~AV1RtpDepacketizer() {}
 
 message_ptr AV1RtpDepacketizer::reassemble(message_buffer &buffer) {
+	/*
+	 * AV1 RTP aggregation header (https://aomediacodec.github.io/av1-rtp-spec/)
+	 *
+	 *  0 1 2 3 4 5 6 7
+	 * +-+-+-+-+-+-+-+-+
+	 * |Z|Y| W |N|-|-|-|
+	 * +-+-+-+-+-+-+-+-+
+	 *
+	 * Z: first OBU element is a continuation fragment from the previous packet
+	 * Y: last OBU element continues in the next packet
+	 * W: number of OBU elements (0 = variable, each with length prefix;
+	 *    1-3 = exact count, all but last have length prefix)
+	 * N: first packet of a coded video sequence
+	 */
+
 	if (buffer.empty())
 		return nullptr;
 
@@ -67,151 +107,104 @@ message_ptr AV1RtpDepacketizer::reassemble(message_buffer &buffer) {
 	auto firstRtpHeader = reinterpret_cast<const RtpHeader *>(first->data());
 	uint8_t payloadType = firstRtpHeader->payloadType();
 	uint32_t timestamp = firstRtpHeader->timestamp();
-	uint16_t nextSeqNumber = firstRtpHeader->seqNumber();
 
 	binary frame;
-	binary currentObu;           // accumulates fragments of a single OBU
-	bool obuContinuation = false; // true when we expect a Z=1 continuation
+	binary pendingFragment;
 
 	for (const auto &packet : buffer) {
 		auto rtpHeader = reinterpret_cast<const RtpHeader *>(packet->data());
-		auto seqDiff = static_cast<int16_t>(rtpHeader->seqNumber() - nextSeqNumber);
-		if (seqDiff < 0)
-			continue; // duplicate / old
-
-		if (seqDiff > 0) {
-			// Gap — discard any in-progress OBU and reset
-			currentObu.clear();
-			obuContinuation = false;
-		}
-		nextSeqNumber = rtpHeader->seqNumber() + 1;
-
 		auto rtpHeaderSize = rtpHeader->getSize() + rtpHeader->getExtensionHeaderSize();
-		size_t paddingSize = 0;
+		auto paddingSize = 0;
 		if (rtpHeader->padding())
 			paddingSize = std::to_integer<uint8_t>(packet->back());
 
-		if (packet->size() <= rtpHeaderSize + paddingSize)
+		if (packet->size() <= rtpHeaderSize + paddingSize + 1)
 			continue;
 
-		const std::byte *payloadData = packet->data() + rtpHeaderSize;
+		const byte *payload = packet->data() + rtpHeaderSize;
 		size_t payloadSize = packet->size() - rtpHeaderSize - paddingSize;
 
 		if (payloadSize < 1)
 			continue;
 
-		uint8_t aggHeader = std::to_integer<uint8_t>(payloadData[0]);
-		bool zFlag = (aggHeader & zMask) != 0;
-		bool yFlag = (aggHeader & yMask) != 0;
-		int  wField = (aggHeader & wMask) >> wShift;
+		byte aggHeader = payload[0];
+		bool zBit = (aggHeader & zMask) != byte(0);
+		bool yBit = (aggHeader & yMask) != byte(0);
+		uint8_t w = std::to_integer<uint8_t>((aggHeader & wMask) >> wBitshift);
 
-		size_t offset = 1; // skip aggregation header
+		size_t offset = 1;
 
-		// If Z=0 but we were expecting a continuation, the previous OBU
-		// was truncated — discard it.
-		if (!zFlag && obuContinuation) {
-			currentObu.clear();
-			obuContinuation = false;
-		}
+		// Extract OBU elements
+		std::vector<std::pair<const byte *, size_t>> elements;
 
-		// Determine how many OBU elements are in this packet.
-		// W=0 means each element has a preceding LEB128 length.
-		// W=1..3 means exactly that many elements; the last one has no
-		// length field (its length is inferred from the remaining payload).
-		int obuCount = wField; // 0 means "use length fields for all"
+		auto parseLeb128 = [&](uint32_t &out) -> bool {
+			out = 0;
+			for (int i = 0; i < 4 && offset < payloadSize; i++) {
+				byte b = payload[offset++];
+				out |= std::to_integer<uint32_t>(b & sevenLsbBitmask) << (i * 7);
+				if ((b & msbBitmask) == byte(0))
+					return true;
+			}
+			return false;
+		};
 
-		if (wField == 0) {
-			// All elements have length fields. Parse them sequentially
-			// until the payload is exhausted.
+		if (w == 0) {
+			// All elements have a LEB128 length prefix
 			while (offset < payloadSize) {
-				size_t lenOffset = offset;
-				uint32_t elemLen = readLeb128(payloadData, payloadSize, offset);
+				uint32_t elemLen = 0;
+				if (!parseLeb128(elemLen))
+					break;
 				if (offset + elemLen > payloadSize)
 					break;
-
-				bool isFirst = (lenOffset == 1);
-				bool isLast = (offset + elemLen >= payloadSize);
-
-				if (isFirst && zFlag) {
-					// Continuation of previous OBU fragment
-					currentObu.insert(currentObu.end(),
-					                  payloadData + offset,
-					                  payloadData + offset + elemLen);
-				}
-				else {
-					// Flush any completed OBU
-					if (!currentObu.empty()) {
-						frame.insert(frame.end(), currentObu.begin(), currentObu.end());
-						currentObu.clear();
-					}
-					currentObu.insert(currentObu.end(),
-					                  payloadData + offset,
-					                  payloadData + offset + elemLen);
-				}
-
-				if (isLast && yFlag) {
-					obuContinuation = true;
-				}
-				else {
-					frame.insert(frame.end(), currentObu.begin(), currentObu.end());
-					currentObu.clear();
-					obuContinuation = false;
-				}
-
+				elements.emplace_back(payload + offset, elemLen);
 				offset += elemLen;
 			}
-		}
-		else {
-			// W = 1..3: exactly wField OBU elements.
-			// First (wField - 1) elements have LEB128 length fields.
-			// The last element fills the remaining payload.
-			for (int i = 0; i < obuCount; i++) {
-				size_t elemLen;
-				if (i < obuCount - 1) {
-					elemLen = readLeb128(payloadData, payloadSize, offset);
+		} else {
+			// W elements: first W-1 have LEB128 length prefix, last uses remaining bytes
+			for (uint8_t i = 0; i < w && offset <= payloadSize; i++) {
+				if (i < w - 1) {
+					uint32_t elemLen = 0;
+					if (!parseLeb128(elemLen))
+						break;
 					if (offset + elemLen > payloadSize)
 						break;
+					elements.emplace_back(payload + offset, elemLen);
+					offset += elemLen;
+				} else {
+					elements.emplace_back(payload + offset, payloadSize - offset);
 				}
-				else {
-					// Last element: remaining payload
-					elemLen = payloadSize - offset;
-				}
+			}
+		}
 
-				bool isFirst = (i == 0);
-				bool isLast = (i == obuCount - 1);
+		// Reassemble OBU elements, handling Z/Y fragmentation
+		size_t n = elements.size();
+		for (size_t i = 0; i < n; i++) {
+			auto [data, size] = elements[i];
+			bool isFirst = (i == 0);
+			bool isLast = (i == n - 1);
 
-				if (isFirst && zFlag) {
-					currentObu.insert(currentObu.end(),
-					                  payloadData + offset,
-					                  payloadData + offset + elemLen);
+			if (isFirst && zBit) {
+				// Continuation of pending OBU fragment
+				pendingFragment.insert(pendingFragment.end(), data, data + size);
+				if (!(isLast && yBit)) {
+					// Fragment complete
+					if (mPacketization == Packetization::TemporalUnit)
+						appendObuWithSize(frame, pendingFragment.data(), pendingFragment.size());
+					else
+						frame.insert(frame.end(), pendingFragment.begin(), pendingFragment.end());
+					pendingFragment.clear();
 				}
-				else {
-					if (!currentObu.empty()) {
-						frame.insert(frame.end(), currentObu.begin(), currentObu.end());
-						currentObu.clear();
-					}
-					currentObu.insert(currentObu.end(),
-					                  payloadData + offset,
-					                  payloadData + offset + elemLen);
-				}
-
-				if (isLast && yFlag) {
-					obuContinuation = true;
-				}
-				else {
-					frame.insert(frame.end(), currentObu.begin(), currentObu.end());
-					currentObu.clear();
-					obuContinuation = false;
-				}
-
-				offset += elemLen;
+			} else if (isLast && yBit) {
+				// This element continues in the next packet
+				pendingFragment.insert(pendingFragment.end(), data, data + size);
+			} else {
+				if (mPacketization == Packetization::TemporalUnit)
+					appendObuWithSize(frame, data, size);
+				else
+					frame.insert(frame.end(), data, data + size);
 			}
 		}
 	}
-
-	// Flush any remaining OBU (from the last packet, where Y=0)
-	if (!currentObu.empty())
-		frame.insert(frame.end(), currentObu.begin(), currentObu.end());
 
 	if (frame.empty())
 		return nullptr;

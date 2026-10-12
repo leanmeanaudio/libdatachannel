@@ -23,12 +23,28 @@ using chrono::steady_clock;
 
 TestResult test_connectivity();
 TestResult test_connectivity_fail_on_wrong_fingerprint();
+TestResult test_dtls_startup_after_remote_description();
 TestResult test_pem();
 TestResult test_negotiated();
 TestResult test_reliability();
+TestResult test_simulcast_sdp_generation();
+TestResult test_simulcast_sdp_parsing();
 TestResult test_turn_connectivity();
 TestResult test_track();
 TestResult test_video_layers_allocation();
+TestResult test_fir_sdp();
+TestResult test_fir_offer_yes_answer_yes();
+TestResult test_rtx_attribute();
+TestResult test_rtx_description_addrtx();
+TestResult test_rtx_description_addrtx_no_audio();
+TestResult test_rtx_dropped_packet();
+TestResult test_rtx_multi_codec();
+TestResult test_rtcp_app_single_packet();
+TestResult test_rtcp_app_compound_packet();
+TestResult test_rtcp_app_empty_data();
+TestResult test_rtcp_app_send();
+TestResult test_rtcp_app_multiple_in_compound();
+TestResult test_rtcp_app_integration();
 TestResult test_capi_connectivity();
 TestResult test_capi_track();
 TestResult test_websocket();
@@ -69,20 +85,36 @@ TestResult test_capi_cleanup() {
 
 static const vector<Test> tests = {
     // C++ API tests
+    Test("DTLS startup after remote description", test_dtls_startup_after_remote_description),
     Test("WebRTC connectivity", test_connectivity),
     Test("WebRTC broken fingerprint", test_connectivity_fail_on_wrong_fingerprint),
     Test("pem", test_pem),
     // TODO: Temporarily disabled as the Open Relay TURN server is unreliable
-    // new Test("WebRTC TURN connectivity", test_turn_connectivity),
+    // Test("WebRTC TURN connectivity", test_turn_connectivity),
     Test("WebRTC negotiated DataChannel", test_negotiated),
     Test("WebRTC reliability mode", test_reliability),
+    Test("WebRTC simulcast SDP generation", test_simulcast_sdp_generation),
+    Test("WebRTC simulcast SDP parsing", test_simulcast_sdp_parsing),
 #if RTC_ENABLE_MEDIA
     Test("WebRTC track", test_track),
 	Test("WebRTC video layers allocation", test_video_layers_allocation),
+    Test("RTX Description::addRtx", test_rtx_description_addrtx),
+    Test("RTX Description::addRtx audio=false", test_rtx_description_addrtx_no_audio),
+    Test("RTX negotiation fallback", test_rtx_attribute),
+    Test("RTX dropped packet recovery", test_rtx_dropped_packet),
+    Test("RTX multi-codec PT mapping", test_rtx_multi_codec),
+    Test("FIR SDP parsing", test_fir_sdp),
+    Test("FIR offer answer handling", test_fir_offer_yes_answer_yes),
+    Test("RTCP APP single packet", test_rtcp_app_single_packet),
+    Test("RTCP APP compound packet", test_rtcp_app_compound_packet),
+    Test("RTCP APP empty data", test_rtcp_app_empty_data),
+    Test("RTCP APP send", test_rtcp_app_send),
+    Test("RTCP APP multiple in compound", test_rtcp_app_multiple_in_compound),
+    Test("RTCP APP integration", test_rtcp_app_integration),
 #endif
 #if RTC_ENABLE_WEBSOCKET
     // TODO: Temporarily disabled as the echo service is unreliable
-    // new Test("WebSocket", test_websocket),
+    // Test("WebSocket", test_websocket),
     Test("WebSocketServer", test_websocketserver),
 #endif
     Test("Cleanup", test_cleanup),

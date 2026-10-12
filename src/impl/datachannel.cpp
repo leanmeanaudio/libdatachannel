@@ -66,7 +66,7 @@ struct AckMessage {
 
 #pragma pack(pop)
 
-bool DataChannel::IsOpenMessage(message_ptr message) {
+bool DataChannel::IsOpenMessage(const message_ptr &message) {
 	if (message->type != Message::Control)
 		return false;
 
@@ -76,7 +76,7 @@ bool DataChannel::IsOpenMessage(message_ptr message) {
 
 DataChannel::DataChannel(weak_ptr<PeerConnection> pc, string label, string protocol,
                          Reliability reliability)
-    : mPeerConnection(pc), mLabel(std::move(label)), mProtocol(std::move(protocol)),
+    : mPeerConnection(std::move(pc)), mLabel(std::move(label)), mProtocol(std::move(protocol)),
       mRecvQueue(RECV_QUEUE_LIMIT, message_size_func) {
 
 	if(reliability.maxPacketLifeTime && reliability.maxRetransmits)
@@ -146,9 +146,9 @@ Reliability DataChannel::reliability() const {
 	return *mReliability;
 }
 
-bool DataChannel::isOpen(void) const { return !mIsClosed && mIsOpen; }
+bool DataChannel::isOpen() const { return !mIsClosed && mIsOpen; }
 
-bool DataChannel::isClosed(void) const { return mIsClosed; }
+bool DataChannel::isClosed() const { return mIsClosed; }
 
 size_t DataChannel::maxMessageSize() const {
 	auto pc = mPeerConnection.lock();
@@ -201,7 +201,7 @@ bool DataChannel::outgoing(message_ptr message) {
 		message->stream = mStream.value();
 	}
 
-	return transport->send(message);
+	return transport->send(std::move(message));
 }
 
 void DataChannel::incoming(message_ptr message) {
@@ -233,7 +233,7 @@ void DataChannel::incoming(message_ptr message) {
 		break;
 	case Message::String:
 	case Message::Binary:
-		mRecvQueue.push(message);
+		mRecvQueue.push(std::move(message));
 		triggerAvailable(mRecvQueue.size());
 		break;
 	default:

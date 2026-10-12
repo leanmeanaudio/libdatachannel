@@ -109,7 +109,8 @@ void PeerConnection::setLocalDescription(Description::Type type, LocalDescriptio
 	case SignalingState::Stable:
 		if (type != Description::Type::Offer) {
 			std::ostringstream oss;
-			oss << "Unexpected local desciption type " << type << " in signaling state "
+			oss.imbue(std::locale::classic());
+			oss << "Unexpected local description type " << type << " in signaling state "
 			    << signalingState;
 			throw std::logic_error(oss.str());
 		}
@@ -120,6 +121,7 @@ void PeerConnection::setLocalDescription(Description::Type type, LocalDescriptio
 	case SignalingState::HaveLocalPranswer:
 		if (type != Description::Type::Answer && type != Description::Type::Pranswer) {
 			std::ostringstream oss;
+			oss.imbue(std::locale::classic());
 			oss << "Unexpected local description type " << type
 			    << " description in signaling state " << signalingState;
 			throw std::logic_error(oss.str());
@@ -129,6 +131,7 @@ void PeerConnection::setLocalDescription(Description::Type type, LocalDescriptio
 
 	default: {
 		std::ostringstream oss;
+		oss.imbue(std::locale::classic());
 		oss << "Unexpected local description in signaling state " << signalingState << ", ignoring";
 		LOG_WARNING << oss.str();
 		return;
@@ -200,6 +203,7 @@ void PeerConnection::setRemoteDescription(Description description) {
 		description.hintType(Description::Type::Offer);
 		if (description.type() != Description::Type::Offer) {
 			std::ostringstream oss;
+			oss.imbue(std::locale::classic());
 			oss << "Unexpected remote " << description.type() << " description in signaling state "
 			    << signalingState;
 			throw std::logic_error(oss.str());
@@ -214,13 +218,13 @@ void PeerConnection::setRemoteDescription(Description description) {
 			// created an offer receives an offer from the remote peer
 			impl()->rollbackLocalDescription();
 			impl()->changeSignalingState(SignalingState::Stable);
-			signalingState = SignalingState::Stable;
 			newSignalingState = SignalingState::HaveRemoteOffer;
 			break;
 		}
 		if (description.type() != Description::Type::Answer &&
 		    description.type() != Description::Type::Pranswer) {
 			std::ostringstream oss;
+			oss.imbue(std::locale::classic());
 			oss << "Unexpected remote " << description.type() << " description in signaling state "
 			    << signalingState;
 			throw std::logic_error(oss.str());
@@ -233,6 +237,7 @@ void PeerConnection::setRemoteDescription(Description description) {
 		if (description.type() != Description::Type::Answer &&
 		    description.type() != Description::Type::Pranswer) {
 			std::ostringstream oss;
+			oss.imbue(std::locale::classic());
 			oss << "Unexpected remote " << description.type() << " description in signaling state "
 			    << signalingState;
 			throw std::logic_error(oss.str());
@@ -242,6 +247,7 @@ void PeerConnection::setRemoteDescription(Description description) {
 
 	default: {
 		std::ostringstream oss;
+		oss.imbue(std::locale::classic());
 		oss << "Unexpected remote description in signaling state " << signalingState;
 		throw std::logic_error(oss.str());
 	}

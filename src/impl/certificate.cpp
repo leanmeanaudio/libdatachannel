@@ -164,6 +164,7 @@ string make_fingerprint(gnutls_x509_crt_t crt,
 	              "X509 fingerprint error");
 
 	std::ostringstream oss;
+	oss.imbue(std::locale::classic());
 	oss << std::hex << std::uppercase << std::setfill('0');
 	for (size_t i = 0; i < len; ++i) {
 		if (i)
@@ -180,30 +181,36 @@ string make_fingerprint(mbedtls_x509_crt *crt,
 	std::vector<unsigned char> buffer(size);
 	std::stringstream fingerprint;
 
+	psa_algorithm_t alg = PSA_ALG_NONE;
+
 	switch (fingerprintAlgorithm) {
 	case CertificateFingerprint::Algorithm::Sha1:
-		mbedtls::check(mbedtls_sha1(crt->raw.p, crt->raw.len, buffer.data()),
-		               "Failed to generate certificate fingerprint");
+		alg = PSA_ALG_SHA_1;
 		break;
 	case CertificateFingerprint::Algorithm::Sha224:
-		mbedtls::check(mbedtls_sha256(crt->raw.p, crt->raw.len, buffer.data(), 1),
-		               "Failed to generate certificate fingerprint");
-
+		alg = PSA_ALG_SHA_224;
 		break;
 	case CertificateFingerprint::Algorithm::Sha256:
-		mbedtls::check(mbedtls_sha256(crt->raw.p, crt->raw.len, buffer.data(), 0),
-		               "Failed to generate certificate fingerprint");
+		alg = PSA_ALG_SHA_256;
 		break;
 	case CertificateFingerprint::Algorithm::Sha384:
-		mbedtls::check(mbedtls_sha512(crt->raw.p, crt->raw.len, buffer.data(), 1),
-		               "Failed to generate certificate fingerprint");
+		alg = PSA_ALG_SHA_384;
 		break;
 	case CertificateFingerprint::Algorithm::Sha512:
-		mbedtls::check(mbedtls_sha512(crt->raw.p, crt->raw.len, buffer.data(), 0),
-		               "Failed to generate certificate fingerprint");
+		alg = PSA_ALG_SHA_512;
 		break;
 	default:
 		throw std::invalid_argument("Unknown fingerprint algorithm");
+	}
+
+	size_t hash_size = 0;
+	int ret = mbedtls::safe_psa([&] {
+		return psa_hash_compute(alg, crt->raw.p, crt->raw.len,
+		        buffer.data(), buffer.size(), &hash_size);
+	});
+	mbedtls::check(ret, "Failed to generate certificate fingerprint");
+	if (hash_size != buffer.size()) {
+		throw std::runtime_error("Unexpected hash size");
 	}
 
 	for (auto i = 0; i < size; i++) {
@@ -231,10 +238,17 @@ Certificate Certificate::FromString(string crt_pem, string key_pem) {
 	                                      reinterpret_cast<const unsigned char *>(crt_pem.c_str()),
 	                                      crt_pem.size() + 1),
 	               "Failed to parse certificate");
+#if MBEDTLS_VERSION_MAJOR < 4
 	mbedtls::check(mbedtls_pk_parse_key(pk.get(),
 	                                    reinterpret_cast<const unsigned char *>(key_pem.c_str()),
 	                                    key_pem.size() + 1, NULL, 0, NULL, 0),
 	               "Failed to parse key");
+#else
+	mbedtls::check(mbedtls_pk_parse_key(pk.get(),
+	                                    reinterpret_cast<const unsigned char *>(key_pem.c_str()),
+	                                    key_pem.size() + 1, NULL, 0),
+	               "Failed to parse key");
+#endif
 
 	return Certificate(std::move(crt), std::move(pk));
 }
@@ -248,8 +262,13 @@ Certificate Certificate::FromFile(const string &crt_pem_file, const string &key_
 
 	mbedtls::check(mbedtls_x509_crt_parse_file(crt.get(), crt_pem_file.c_str()),
 	               "Failed to parse certificate");
+#if MBEDTLS_VERSION_MAJOR < 4
 	mbedtls::check(mbedtls_pk_parse_keyfile(pk.get(), key_pem_file.c_str(), pass.c_str(), 0, NULL),
 	               "Failed to parse key");
+#else
+	mbedtls::check(mbedtls_pk_parse_keyfile(pk.get(), key_pem_file.c_str(), pass.c_str()),
+	               "Failed to parse key");
+#endif
 
 	return Certificate(std::move(crt), std::move(pk));
 }
@@ -257,24 +276,13 @@ Certificate Certificate::FromFile(const string &crt_pem_file, const string &key_
 Certificate Certificate::Generate(CertificateType type, const string &commonName) {
 	PLOG_DEBUG << "Generating certificate (MbedTLS)";
 
-	mbedtls_entropy_context entropy;
-	mbedtls_ctr_drbg_context drbg;
 	mbedtls_x509write_cert wcrt;
-	mbedtls_mpi serial;
 	auto crt = mbedtls::new_x509_crt();
 	auto pk = mbedtls::new_pk_context();
 
-	mbedtls_entropy_init(&entropy);
-	mbedtls_ctr_drbg_init(&drbg);
-	mbedtls_ctr_drbg_set_prediction_resistance(&drbg, MBEDTLS_CTR_DRBG_PR_ON);
 	mbedtls_x509write_crt_init(&wcrt);
-	mbedtls_mpi_init(&serial);
 
 	try {
-		mbedtls::check(mbedtls_ctr_drbg_seed(
-		    &drbg, mbedtls_entropy_func, &entropy,
-		    reinterpret_cast<const unsigned char *>(commonName.data()), commonName.size()));
-
 		switch (type) {
 		// RFC 8827 WebRTC Security Architecture 6.5. Communications Security
 		// All implementations MUST support DTLS 1.2 with the
@@ -282,20 +290,42 @@ Certificate Certificate::Generate(CertificateType type, const string &commonName
 		// See https://www.rfc-editor.org/rfc/rfc8827.html#section-6.5
 		case CertificateType::Default:
 		case CertificateType::Ecdsa: {
-			mbedtls::check(mbedtls_pk_setup(pk.get(), mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY)));
-			mbedtls::check(mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(*pk.get()),
-			                                   mbedtls_ctr_drbg_random, &drbg),
-			               "Unable to generate ECDSA P-256 key pair");
+			int ret = mbedtls::safe_psa([&] {
+				psa_key_id_t slot = PSA_KEY_ID_NULL;
+				psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+				psa_set_key_type(&attr, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+				psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_EXPORT | PSA_KEY_USAGE_COPY);
+				psa_set_key_bits(&attr, 256);
+				int ret = psa_generate_key(&attr, &slot);
+				if (ret) {
+					psa_destroy_key(slot);
+					return ret;
+				}
+				ret = mbedtls_pk_copy_from_psa(slot, pk.get());
+				psa_destroy_key(slot);
+				return ret;
+			});
+			mbedtls::check(ret, "Unable to generate ECDSA P-256 key pair");
 			break;
 		}
 		case CertificateType::Rsa: {
 			const unsigned int nbits = 2048;
-			const int exponent = 65537;
-
-			mbedtls::check(mbedtls_pk_setup(pk.get(), mbedtls_pk_info_from_type(MBEDTLS_PK_RSA)));
-			mbedtls::check(mbedtls_rsa_gen_key(mbedtls_pk_rsa(*pk.get()), mbedtls_ctr_drbg_random,
-			                                   &drbg, nbits, exponent),
-			               "Unable to generate RSA key pair");
+			int ret = mbedtls::safe_psa([&] {
+				psa_key_id_t slot = PSA_KEY_ID_NULL;
+				psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+				psa_set_key_type(&attr, PSA_KEY_TYPE_RSA_KEY_PAIR);
+				psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_EXPORT | PSA_KEY_USAGE_COPY);
+				psa_set_key_bits(&attr, nbits);
+				int ret = psa_generate_key(&attr, &slot);
+				if (ret) {
+					psa_destroy_key(slot);
+					return ret;
+				}
+				ret = mbedtls_pk_copy_from_psa(slot, pk.get());
+				psa_destroy_key(slot);
+				return ret;
+			});
+			mbedtls::check(ret, "Unable to generate RSA key pair");
 			break;
 		}
 		default:
@@ -308,13 +338,13 @@ Certificate Certificate::Generate(CertificateType type, const string &commonName
 
 		const size_t serialBufferSize = 16;
 		unsigned char serialBuffer[serialBufferSize];
-		mbedtls::check(mbedtls_ctr_drbg_random(&drbg, serialBuffer, serialBufferSize),
-		               "Failed to generate certificate");
-		mbedtls::check(mbedtls_mpi_read_binary(&serial, serialBuffer, serialBufferSize),
-		               "Failed to generate certificate");
+		int ret = mbedtls::safe_psa([&] {
+			return psa_generate_random(serialBuffer, serialBufferSize);
+		});
+		mbedtls::check(ret, "Failed to generate certificate");
 
 		std::string name = std::string("O=" + commonName + ",CN=" + commonName);
-		mbedtls::check(mbedtls_x509write_crt_set_serial(&wcrt, &serial),
+		mbedtls::check(mbedtls_x509write_crt_set_serial_raw(&wcrt, serialBuffer, serialBufferSize),
 		               "Failed to generate certificate");
 		mbedtls::check(mbedtls_x509write_crt_set_subject_name(&wcrt, name.c_str()),
 		               "Failed to generate certificate");
@@ -333,8 +363,13 @@ Certificate Certificate::Generate(CertificateType type, const string &commonName
 		unsigned char certificateBuffer[certificateBufferSize];
 		std::memset(certificateBuffer, 0, certificateBufferSize);
 
+#if MBEDTLS_VERSION_MAJOR < 4
 		auto certificateLen = mbedtls_x509write_crt_der(
-		    &wcrt, certificateBuffer, certificateBufferSize, mbedtls_ctr_drbg_random, &drbg);
+		    &wcrt, certificateBuffer, certificateBufferSize, &mbedtls::random_func, nullptr);
+#else
+		auto certificateLen = mbedtls_x509write_crt_der(
+		    &wcrt, certificateBuffer, certificateBufferSize);
+#endif
 		if (certificateLen <= 0) {
 			throw std::runtime_error("Certificate generation failed");
 		}
@@ -344,17 +379,11 @@ Certificate Certificate::Generate(CertificateType type, const string &commonName
 		                   certificateLen),
 		               "Failed to generate certificate");
 	} catch (...) {
-		mbedtls_entropy_free(&entropy);
-		mbedtls_ctr_drbg_free(&drbg);
 		mbedtls_x509write_crt_free(&wcrt);
-		mbedtls_mpi_free(&serial);
 		throw;
 	}
 
-	mbedtls_entropy_free(&entropy);
-	mbedtls_ctr_drbg_free(&drbg);
 	mbedtls_x509write_crt_free(&wcrt);
-	mbedtls_mpi_free(&serial);
 	return Certificate(std::move(crt), std::move(pk));
 }
 
@@ -404,7 +433,7 @@ Certificate Certificate::FromString(string crt_pem, string key_pem) {
 	if (!pkey)
 		throw std::invalid_argument("Unable to import PEM key");
 
-	return Certificate(x509, pkey, std::move(chain));
+	return {x509, pkey, std::move(chain)};
 }
 
 Certificate Certificate::FromFile(const string &crt_pem_file, const string &key_pem_file,
@@ -438,7 +467,7 @@ Certificate Certificate::FromFile(const string &crt_pem_file, const string &key_
 	if (!pkey)
 		throw std::invalid_argument("Unable to import PEM key from file");
 
-	return Certificate(x509, pkey, std::move(chain));
+	return {x509, pkey, std::move(chain)};
 }
 
 Certificate Certificate::Generate(CertificateType type, const string &commonName) {
@@ -510,9 +539,6 @@ Certificate Certificate::Generate(CertificateType type, const string &commonName
 	auto *commonNameBytes =
 	    reinterpret_cast<unsigned char *>(const_cast<char *>(commonName.c_str()));
 
-	if (!X509_set_pubkey(x509.get(), pkey.get()))
-		throw std::runtime_error("Unable to set certificate public key");
-
 	if (!X509_gmtime_adj(X509_getm_notBefore(x509.get()), 3600 * -1) ||
 	    !X509_gmtime_adj(X509_getm_notAfter(x509.get()), 3600 * 24 * 365) ||
 #if OPENSSL_VERSION_NUMBER >= 0x30000000
@@ -528,10 +554,13 @@ Certificate Certificate::Generate(CertificateType type, const string &commonName
 	    !X509_set_issuer_name(x509.get(), name.get()))
 		throw std::runtime_error("Unable to set certificate properties");
 
+	if (!X509_set_pubkey(x509.get(), pkey.get()))
+		throw std::runtime_error("Unable to set certificate public key");
+
 	if (!X509_sign(x509.get(), pkey.get(), EVP_sha256()))
 		throw std::runtime_error("Unable to auto-sign certificate");
 
-	return Certificate(x509, pkey);
+	return {x509, pkey};
 }
 
 Certificate::Certificate(shared_ptr<X509> x509, shared_ptr<EVP_PKEY> pkey,
@@ -581,6 +610,7 @@ string make_fingerprint(X509 *x509, CertificateFingerprint::Algorithm fingerprin
 		throw std::runtime_error("X509 fingerprint error");
 
 	std::ostringstream oss;
+	oss.imbue(std::locale::classic());
 	oss << std::hex << std::uppercase << std::setfill('0');
 	for (size_t i = 0; i < len; ++i) {
 		if (i)

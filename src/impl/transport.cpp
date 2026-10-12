@@ -38,7 +38,24 @@ void Transport::unregisterIncoming() {
 
 Transport::State Transport::state() const { return mState; }
 
-void Transport::onRecv(message_callback callback) { mRecvCallback = std::move(callback); }
+void Transport::onRecv(message_callback callback) {
+	std::vector<message_ptr> pending;
+	{
+		std::lock_guard lock(mPendingMutex);
+		mRecvCallback = std::move(callback);
+		if (mRecvCallback)
+			pending = std::move(mPendingRecv);
+		else
+			mPendingRecv.clear();
+	}
+	for (auto &msg : pending) {
+		try {
+			mRecvCallback(std::move(msg));
+		} catch (const std::exception &e) {
+			PLOG_WARNING << e.what();
+		}
+	}
+}
 
 void Transport::onStateChange(state_callback callback) {
 	mStateChangeCallback = std::move(callback);
@@ -48,11 +65,22 @@ void Transport::start() { registerIncoming(); }
 
 void Transport::stop() { unregisterIncoming(); }
 
-bool Transport::send(message_ptr message) { return outgoing(message); }
+bool Transport::send(message_ptr message) { return outgoing(std::move(message)); }
 
 void Transport::recv(message_ptr message) {
 	try {
-		mRecvCallback(message);
+		std::unique_lock lock(mPendingMutex);
+		if (!mRecvCallback) {
+			// No callback registered yet; buffer the message for replay when
+			// onRecv() is called.  Bounded to avoid unbounded growth.
+			if (mPendingRecv.size() < 8)
+				mPendingRecv.push_back(std::move(message));
+			else
+				PLOG_WARNING << "dropping incoming message, no receive callback";
+			return;
+		}
+		lock.unlock();
+		mRecvCallback(std::move(message));
 	} catch (const std::exception &e) {
 		PLOG_WARNING << e.what();
 	}
@@ -67,11 +95,11 @@ void Transport::changeState(State state) {
 	}
 }
 
-void Transport::incoming(message_ptr message) { recv(message); }
+void Transport::incoming(message_ptr message) { recv(std::move(message)); }
 
 bool Transport::outgoing(message_ptr message) {
 	if (mLower)
-		return mLower->send(message);
+		return mLower->send(std::move(message));
 	else
 		return false;
 }

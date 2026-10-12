@@ -388,8 +388,10 @@ bool SctpTransport::send(message_ptr message) {
 	if (trySendQueue() && trySendMessage(message))
 		return true;
 
-	mSendQueue.push(message);
-	updateBufferedAmount(to_uint16(message->stream), ptrdiff_t(message_size_func(message)));
+	const uint16_t streamId = to_uint16(message->stream);
+	const ptrdiff_t size = ptrdiff_t(message_size_func(message));
+	mSendQueue.push(std::move(message));
+	updateBufferedAmount(streamId, size);
 	return false;
 }
 
@@ -596,7 +598,7 @@ bool SctpTransport::trySendQueue() {
 	return true;
 }
 
-bool SctpTransport::trySendMessage(message_ptr message) {
+bool SctpTransport::trySendMessage(const message_ptr &message) {
 	// Requires mSendMutex to be locked
 	if (state() != State::Connected)
 		return false;
@@ -900,6 +902,7 @@ void SctpTransport::processNotification(const union sctp_notification *notify, s
 
 		IF_PLOG(plog::verbose) {
 			std::ostringstream desc;
+			desc.imbue(std::locale::classic());
 			desc << "flags=";
 			if (flags & SCTP_STREAM_RESET_OUTGOING_SSN && flags & SCTP_STREAM_RESET_INCOMING_SSN)
 				desc << "outgoing|incoming";
