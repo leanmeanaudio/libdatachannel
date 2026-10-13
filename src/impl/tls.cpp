@@ -10,6 +10,7 @@
 
 #include <fstream>
 #include <stdexcept>
+#include <string>
 
 #if USE_GNUTLS
 
@@ -96,6 +97,33 @@ size_t my_strftme(char *buf, size_t size, const char *format, const time_t *t) {
 
 namespace rtc::mbedtls {
 
+void init() {
+	check(psa_crypto_init(), "psa_crypto_init failed.");
+}
+
+#if !defined(MBEDTLS_THREADING_C)
+std::mutex psa_mutex;
+
+int safe_psa(std::function<int()> func) {
+	std::unique_lock<std::mutex> lock(psa_mutex);
+	return func();
+}
+
+int random_func(void *rng, unsigned char *out, size_t len) {
+	std::unique_lock<std::mutex> lock(psa_mutex);
+	(void)rng;
+	return psa_generate_random(out, len);
+}
+#else
+int safe_psa(std::function<int()> func) {
+	return func();
+}
+int random_func(void *rng, unsigned char *out, size_t len) {
+	(void)rng;
+	return psa_generate_random(out, len);
+}
+#endif
+
 // Return false on non-fatal error
 bool check(int ret, const string &message) {
 	if (ret < 0) {
@@ -119,7 +147,7 @@ string format_time(const std::chrono::system_clock::time_point &tp) {
 	if (my_strftme(buffer, bufferSize, "%Y%m%d%H%M%S", &t) == 0)
 		throw std::runtime_error("Time conversion failed");
 
-	return string(buffer);
+	return {buffer};
 };
 
 std::shared_ptr<mbedtls_pk_context> new_pk_context() {
@@ -171,7 +199,7 @@ string error_string(unsigned long error) {
 	const size_t bufferSize = 256;
 	char buffer[bufferSize];
 	ERR_error_string_n(error, buffer, bufferSize);
-	return string(buffer);
+	return {buffer};
 }
 
 bool check(int success, const string &message) {
@@ -184,8 +212,31 @@ bool check(int success, const string &message) {
 	throw std::runtime_error(message + (last_error != 0 ? ": " + error_string(last_error) : ""));
 }
 
+namespace {
+
+string want_string(int want) {
+	switch (want) {
+	case SSL_NOTHING:
+		return "nothing";
+	case SSL_WRITING:
+		return "writing";
+	case SSL_READING:
+		return "reading";
+	case SSL_X509_LOOKUP:
+		return "x509_lookup";
+#ifdef SSL_RETRY_VERIFY
+	case SSL_RETRY_VERIFY:
+		return "retry_verify";
+#endif
+	default:
+		return std::to_string(want);
+	}
+}
+
+} // namespace
+
 // Return false on recoverable error
-bool check_error(int err, const string &message) {
+bool check_error(int err, const string &message, const SSL *ssl) {
 	unsigned long last_error = ERR_peek_last_error();
 	ERR_clear_error();
 
@@ -195,8 +246,18 @@ bool check_error(int err, const string &message) {
 	if (err == SSL_ERROR_ZERO_RETURN)
 		throw std::runtime_error(message + ": peer closed connection");
 
-	if (err == SSL_ERROR_SYSCALL)
-		throw std::runtime_error(message + ": fatal I/O error");
+	if (err == SSL_ERROR_SYSCALL) {
+		// SSL_get_error() returns SSL_ERROR_SYSCALL both for a real I/O failure and as its
+		// fall-through: when the SSL object wants I/O but the corresponding BIO's retry flags
+		// do not say so, it drops past every branch and lands here with an empty error queue.
+		// The transports below feed OpenSSL from memory BIOs, so that fall-through is a likely
+		// cause, and a bare "fatal I/O error" does not distinguish it. SSL_want() is the SSL
+		// object's own state, so it is meaningful regardless of where any syscall happened.
+		string detail = ": fatal I/O error";
+		if (ssl)
+			detail += " (want=" + want_string(SSL_want(ssl)) + ")";
+		throw std::runtime_error(message + detail);
+	}
 
 	if (err == SSL_ERROR_SSL)
 		throw std::runtime_error(message +

@@ -39,7 +39,120 @@ RtcpReceivingSession::SyncTimestamps RtcpReceivingSession::getSyncTimestamps(){
 	return mSyncTimestamps;
 }
 
+void RtcpReceivingSession::media(const Description::Media &desc) {
+	bool newRtxEnabled = false;
+	std::unordered_map<uint8_t, uint8_t> newRtxToPrimaryPtMap;
+	SSRC newRtxPrimarySsrc = 0;
+
+	if (desc.isRtxEnabled()) {
+		auto pts = desc.payloadTypes();
+
+		auto ssrcs = desc.getSSRCs();
+		for (auto ssrc : ssrcs) {
+			auto rtxSsrc = desc.getRtxSsrcForSsrc(ssrc);
+			if (rtxSsrc) {
+				newRtxPrimarySsrc = ssrc;
+				break;
+			}
+		}
+
+		// Build mapping from each RTX PT to its primary PT
+		for (int pt : pts) {
+			auto rtxPt = desc.getRtxPayloadType(pt);
+			if (rtxPt) {
+				newRtxToPrimaryPtMap[static_cast<uint8_t>(*rtxPt)] =
+				    static_cast<uint8_t>(pt);
+			}
+		}
+
+		// Enable RTX if PT mapping is not empty
+		newRtxEnabled = !newRtxToPrimaryPtMap.empty();
+	}
+
+	std::lock_guard lock(mMutex);
+	mRtxEnabled = newRtxEnabled;
+	mRtxToPrimaryPtMap = std::move(newRtxToPrimaryPtMap);
+	mRtxPrimarySsrc = newRtxPrimarySsrc;
+
+	// Check if RFC 5104 FIR support should be enabled
+	for (const auto payloadType : desc.payloadTypes()) {
+		const Description::Media::RtpMap* rtpMap = desc.rtpMap(payloadType);
+		if (rtpMap->hasFeedback("ccm fir")) {
+			mSupportsRfc5104Fir = true;
+		}
+	}
+}
+
+message_ptr RtcpReceivingSession::unwrapRtx(const message_ptr &rtxPacket) {
+	if (!rtxPacket || rtxPacket->size() < sizeof(RtpHeader) + sizeof(uint16_t))
+		return nullptr;
+
+	auto rtxRtp = reinterpret_cast<const RtpHeader *>(rtxPacket->data());
+	uint8_t rtxPt = rtxRtp->payloadType();
+
+	SSRC primarySsrc;
+	uint8_t primaryPayloadType;
+	{
+		std::lock_guard lock(mMutex);
+		primarySsrc = mRtxPrimarySsrc;
+		// If primary SSRC not provided in SDP and first primary packet not arrived return nullptr
+		if (primarySsrc == 0)
+			return nullptr;
+		auto it = mRtxToPrimaryPtMap.find(rtxPt);
+		if (it == mRtxToPrimaryPtMap.end())
+			return nullptr;
+		primaryPayloadType = it->second;
+	}
+
+	size_t totalSize = rtxPacket->size();
+
+	// Allocate a new message to prevent corruption
+	auto unwrapped = make_message(totalSize, rtxPacket);
+
+	auto rtx = reinterpret_cast<RtpRtx *>(unwrapped->data());
+	size_t newSize = rtx->normalizePacket(totalSize, primarySsrc, primaryPayloadType);
+
+	unwrapped->resize(newSize);
+	unwrapped->stream = primarySsrc;
+	return unwrapped;
+}
+
 void RtcpReceivingSession::incoming(message_vector &messages, const message_callback &send) {
+	// Unwrap RTX packets before processing
+	bool rtxEnabled;
+	std::unordered_map<uint8_t, uint8_t> rtxToPrimaryPtMap;
+	{
+		std::lock_guard lock(mMutex);
+		rtxEnabled = mRtxEnabled;
+		rtxToPrimaryPtMap = mRtxToPrimaryPtMap;
+	}
+
+	if (rtxEnabled) {
+		for (auto &message : messages) {
+			if (message->type == Message::Control)
+				continue;
+
+			if (message->size() < sizeof(RtpHeader))
+				continue;
+
+			auto rtp = reinterpret_cast<const RtpHeader *>(message->data());
+			uint8_t pt = rtp->payloadType();
+
+			if (rtxToPrimaryPtMap.count(pt)) {
+				// RTX packet
+				auto unwrapped = unwrapRtx(message);
+				if (unwrapped)
+					message = unwrapped;
+			} else {
+				// Primary packet
+				std::lock_guard lock(mMutex);
+				// if mRtxPrimarySsrc was not provided in SDP set it
+				if (mRtxPrimarySsrc == 0)
+					mRtxPrimarySsrc = rtp->ssrc();
+			}
+		}
+	}
+
 	message_vector result;
 	for (auto message : messages) {
 		switch (message->type) {
@@ -131,7 +244,7 @@ void RtcpReceivingSession::pushREMB(const message_callback &send, unsigned int b
 	auto message = make_message(RtcpRemb::SizeWithSSRCs(1), Message::Control);
 	auto remb = reinterpret_cast<RtcpRemb *>(message->data());
 	remb->preparePacket(mSsrc, 1, bitrate);
-	remb->setSsrc(0, mSsrc);
+	remb->setSSRC(0, mSsrc);
 	send(message);
 }
 
@@ -171,9 +284,42 @@ void RtcpReceivingSession::pushRR(const message_callback &send, unsigned int las
 	send(message);
 }
 
-bool RtcpReceivingSession::requestKeyframe(const message_callback &send) {
-	pushPLI(send);
+bool RtcpReceivingSession::requestKeyframe(const std::vector<SSRC>& targetSSRCs, bool retransmit, const message_callback &send) {
+	if (mSupportsRfc5104Fir) {
+		pushFIR(send, targetSSRCs, retransmit);
+	} else {
+		pushPLI(send);
+	}
 	return true;
+}
+
+void RtcpReceivingSession::pushFIR(const message_callback &send, const std::vector<SSRC>& targetSSRCs, bool retransmit) {
+	std::vector<RtcpFirFci> firFcisToSend;
+	if (targetSSRCs.size() > 0) {
+		for (const auto& ssrc : targetSSRCs) {
+			SSRC targetSSRC = ssrc;
+			if (targetSSRC == 0)
+				targetSSRC = mSsrc;
+			if (!retransmit)
+				++mRfc5104FirCmdNums[targetSSRC];
+
+			RtcpFirFci firFci;
+			firFci.preparePacket(targetSSRC, static_cast<uint8_t>(mRfc5104FirCmdNums[targetSSRC] % 256));
+			firFcisToSend.push_back(firFci);
+		}
+	} else {
+		if (!retransmit)
+			++mRfc5104FirCmdNums[mSsrc];
+
+		RtcpFirFci firFci;
+		firFci.preparePacket(mSsrc, static_cast<uint8_t>(mRfc5104FirCmdNums[mSsrc] % 256));
+		firFcisToSend.push_back(firFci);
+	}
+	auto message = make_message(RtcpFir::SizeWithFcis(int(firFcisToSend.size())), Message::Control);
+	auto *fir = reinterpret_cast<RtcpFir *>(message->data());
+
+	fir->preparePacket(mSsrc, firFcisToSend);
+	send(message);
 }
 
 void RtcpReceivingSession::pushPLI(const message_callback &send) {

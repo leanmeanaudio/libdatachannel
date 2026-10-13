@@ -125,7 +125,7 @@ bool TlsTransport::send(message_ptr message) {
 		throw std::runtime_error("TLS is not open");
 
 	if (!message || message->size() == 0)
-		return outgoing(message); // pass through
+		return outgoing(std::move(message)); // pass through
 
 	PLOG_VERBOSE << "Send size=" << message->size();
 
@@ -148,7 +148,7 @@ void TlsTransport::incoming(message_ptr message) {
 	}
 
 	PLOG_VERBOSE << "Incoming size=" << message->size();
-	mIncomingQueue.push(message);
+	mIncomingQueue.push(std::move(message));
 	enqueueRecv();
 }
 
@@ -258,8 +258,9 @@ ssize_t TlsTransport::ReadCallback(gnutls_transport_ptr_t ptr, void *data, size_
 				message = *next;
 				if (message->size() > 0)
 					break;
-				else
-					t->recv(message); // Pass zero-sized messages through
+
+				t->recv(std::move(message)); // Pass zero-sized messages through
+				message.reset();
 			}
 		}
 
@@ -323,23 +324,19 @@ TlsTransport::TlsTransport(variant<shared_ptr<TcpTransport>, shared_ptr<HttpProx
 
 	PLOG_DEBUG << "Initializing TLS transport (MbedTLS)";
 
-	psa_crypto_init();
-	mbedtls_entropy_init(&mEntropy);
-	mbedtls_ctr_drbg_init(&mDrbg);
 	mbedtls_ssl_init(&mSsl);
 	mbedtls_ssl_config_init(&mConf);
-	mbedtls_ctr_drbg_set_prediction_resistance(&mDrbg, MBEDTLS_CTR_DRBG_PR_ON);
 
 	try {
-		mbedtls::check(mbedtls_ctr_drbg_seed(&mDrbg, mbedtls_entropy_func, &mEntropy, NULL, 0));
-
 		mbedtls::check(mbedtls_ssl_config_defaults(
 		    &mConf, mIsClient ? MBEDTLS_SSL_IS_CLIENT : MBEDTLS_SSL_IS_SERVER,
 		    MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT));
 
-		mbedtls_ssl_conf_max_version(&mConf, MBEDTLS_SSL_MAJOR_VERSION_3, MBEDTLS_SSL_MINOR_VERSION_3); // TLS 1.2
-		mbedtls_ssl_conf_authmode(&mConf, MBEDTLS_SSL_VERIFY_OPTIONAL);
-		mbedtls_ssl_conf_rng(&mConf, mbedtls_ctr_drbg_random, &mDrbg);
+		mbedtls_ssl_conf_max_tls_version(&mConf, MBEDTLS_SSL_VERSION_TLS1_2);
+		mbedtls_ssl_conf_authmode(&mConf, MBEDTLS_SSL_VERIFY_NONE);
+#if MBEDTLS_VERSION_MAJOR < 4
+		mbedtls_ssl_conf_rng(&mConf, &mbedtls::random_func, nullptr);
+#endif
 
 		if (certificate) {
 			auto [crt, pk] = certificate->credentials();
@@ -355,8 +352,6 @@ TlsTransport::TlsTransport(variant<shared_ptr<TcpTransport>, shared_ptr<HttpProx
 		mbedtls_ssl_set_bio(&mSsl, static_cast<void *>(this), WriteCallback, ReadCallback, NULL);
 
 	} catch (...) {
-		mbedtls_entropy_free(&mEntropy);
-		mbedtls_ctr_drbg_free(&mDrbg);
 		mbedtls_ssl_free(&mSsl);
 		mbedtls_ssl_config_free(&mConf);
 		throw;
@@ -367,8 +362,6 @@ TlsTransport::~TlsTransport() {
 	stop();
 
 	PLOG_DEBUG << "Destroying TLS transport";
-	mbedtls_entropy_free(&mEntropy);
-	mbedtls_ctr_drbg_free(&mDrbg);
 	mbedtls_ssl_free(&mSsl);
 	mbedtls_ssl_config_free(&mConf);
 }
@@ -392,7 +385,7 @@ bool TlsTransport::send(message_ptr message) {
 		throw std::runtime_error("TLS is not open");
 
 	if (!message || message->size() == 0)
-		return outgoing(message); // pass through
+		return outgoing(std::move(message)); // pass through
 
 	PLOG_VERBOSE << "Send size=" << message->size();
 
@@ -417,7 +410,7 @@ void TlsTransport::incoming(message_ptr message) {
 	}
 
 	PLOG_VERBOSE << "Incoming size=" << message->size();
-	mIncomingQueue.push(message);
+	mIncomingQueue.push(std::move(message));
 	enqueueRecv();
 }
 
@@ -529,8 +522,9 @@ int TlsTransport::ReadCallback(void *ctx, unsigned char *buf, size_t len) {
 				message = *next;
 				if (message->size() > 0)
 					break;
-				else
-					t->recv(message); // Pass zero-sized messages through
+
+				t->recv(std::move(message)); // Pass zero-sized messages through
+				message.reset();
 			}
 		}
 
@@ -622,8 +616,11 @@ TlsTransport::TlsTransport(variant<shared_ptr<TcpTransport>, shared_ptr<HttpProx
 
 		if (mIsClient && mHost) {
 			SSL_set_hostflags(mSsl, 0);
+#if OPENSSL_VERSION_NUMBER >= 0x40000000
+			openssl::check(SSL_set1_dnsname(mSsl, mHost->c_str()), "Failed to set SSL dnsname");
+#else
 			openssl::check(SSL_set1_host(mSsl, mHost->c_str()), "Failed to set SSL host");
-
+#endif
 			PLOG_VERBOSE << "Server Name Indication: " << *mHost;
 			SSL_set_tlsext_host_name(mSsl, mHost->c_str());
 		}
@@ -671,7 +668,7 @@ void TlsTransport::start() {
 		flushOutput();
 	}
 
-	openssl::check_error(err, "Handshake failed");
+	openssl::check_error(err, "Handshake failed", mSsl);
 }
 
 void TlsTransport::stop() {
@@ -686,7 +683,7 @@ bool TlsTransport::send(message_ptr message) {
 		throw std::runtime_error("TLS is not open");
 
 	if (!message || message->size() == 0)
-		return outgoing(message); // pass through
+		return outgoing(std::move(message)); // pass through
 
 	PLOG_VERBOSE << "Send size=" << message->size();
 
@@ -713,7 +710,7 @@ void TlsTransport::incoming(message_ptr message) {
 	}
 
 	PLOG_VERBOSE << "Incoming size=" << message->size();
-	mIncomingQueue.push(message);
+	mIncomingQueue.push(std::move(message));
 	enqueueRecv();
 }
 
@@ -741,22 +738,25 @@ void TlsTransport::doRecv() {
 				return;
 
 			message_ptr message = std::move(*next);
-			if (message->size() > 0)
-				BIO_write(mInBio, message->data(), int(message->size())); // Input
-			else
-				recv(message); // Pass zero-sized messages through
+			if (message->size() == 0) {
+				recv(std::move(message)); // Pass zero-sized messages through
+				continue;
+			}
 
+			bool incomingWritten = false;
 			if (state() == State::Connecting) {
 				// Continue the handshake
 				int ret, err;
 				{
 					std::lock_guard lock(mSslMutex);
+					BIO_write(mInBio, message->data(), int(message->size()));
+					incomingWritten = true;
 					ret = SSL_do_handshake(mSsl);
 					err = SSL_get_error(mSsl, ret);
 					flushOutput();
 				}
 
-				if (openssl::check_error(err, "Handshake failed")) {
+				if (openssl::check_error(err, "Handshake failed", mSsl)) {
 					PLOG_INFO << "TLS handshake finished";
 					changeState(State::Connected);
 					postHandshake();
@@ -768,6 +768,10 @@ void TlsTransport::doRecv() {
 				while (true) {
 					{
 						std::lock_guard lock(mSslMutex);
+						if (!incomingWritten) {
+							BIO_write(mInBio, message->data(), int(message->size()));
+							incomingWritten = true;
+						}
 						ret = SSL_read(mSsl, buffer, bufferSize);
 						err = SSL_get_error(mSsl, ret);
 						flushOutput(); // SSL_read() can also cause write operations

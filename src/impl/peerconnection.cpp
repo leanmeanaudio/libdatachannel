@@ -171,7 +171,8 @@ shared_ptr<IceTransport> PeerConnection::initIceTransport() {
 						    break;
 					    case IceTransport::State::Connected:
 						    changeIceState(IceState::Connected);
-						    initDtlsTransport();
+						    if (remoteDescription())
+							    initDtlsTransport();
 						    break;
 					    case IceTransport::State::Completed:
 						    changeIceState(IceState::Completed);
@@ -221,6 +222,7 @@ shared_ptr<IceTransport> PeerConnection::initIceTransport() {
 
 shared_ptr<DtlsTransport> PeerConnection::initDtlsTransport() {
 	try {
+		std::lock_guard lock(mDtlsTransportInitMutex);
 		if (auto transport = std::atomic_load(&mDtlsTransport))
 			return transport;
 
@@ -474,7 +476,7 @@ void PeerConnection::forwardMessage(message_ptr message) {
 	if (!iceTransport || !sctpTransport)
 		return;
 
-	const uint16_t stream = uint16_t(message->stream);
+	auto const stream = uint16_t(message->stream);
 	auto [channel, found] = findDataChannel(stream);
 
 	if (DataChannel::IsOpenMessage(message)) {
@@ -521,7 +523,7 @@ void PeerConnection::forwardMessage(message_ptr message) {
 
 	if (channel) {
 		// Forward the message
-		channel->incoming(message);
+		channel->incoming(std::move(message));
 	} else {
 		// DataChannel was destroyed, ignore
 		PLOG_DEBUG << "Ignored message on stream " << stream << ", DataChannel is destroyed";
@@ -570,49 +572,91 @@ void PeerConnection::dispatchMedia([[maybe_unused]] message_ptr message) {
 	if (message->type == Message::Control) {
 		std::set<uint32_t> ssrcs;
 		size_t offset = 0;
-		while ((sizeof(RtcpHeader) + offset) <= message->size()) {
+		while (offset + sizeof(RtcpHeader) <= message->size()) {
 			auto header = reinterpret_cast<RtcpHeader *>(message->data() + offset);
-			if (header->lengthInBytes() > message->size() - offset) {
+			size_t length = header->lengthInBytes();
+			if (offset + length > message->size()) {
 				COUNTER_MEDIA_TRUNCATED++;
 				break;
 			}
-			offset += header->lengthInBytes();
-			if (header->payloadType() == 205 || header->payloadType() == 206) {
-				auto rtcpfb = reinterpret_cast<RtcpFbHeader *>(header);
-				ssrcs.insert(rtcpfb->packetSenderSSRC());
-				ssrcs.insert(rtcpfb->mediaSourceSSRC());
+			switch(header->payloadType()) {
+			case 200: // SR
+				if (length >= sizeof(RtcpSr)) {
+					auto rtcpsr = reinterpret_cast<RtcpSr *>(header);
+					ssrcs.insert(rtcpsr->senderSSRC());
+					for (int i = 0; i < rtcpsr->header.reportCount(); ++i)
+						if (const auto *reportBlock = rtcpsr->getReportBlock(i))
+							ssrcs.insert(reportBlock->getSSRC());
+				}
+				break;
 
-			} else if (header->payloadType() == 200) {
-				auto rtcpsr = reinterpret_cast<RtcpSr *>(header);
-				ssrcs.insert(rtcpsr->senderSSRC());
-				for (int i = 0; i < rtcpsr->header.reportCount(); ++i)
-					if (const auto *reportBlock = rtcpsr->getReportBlock(i))
-						ssrcs.insert(reportBlock->getSSRC());
-			} else if (header->payloadType() == 201) {
-				auto rtcprr = reinterpret_cast<RtcpRr *>(header);
-				ssrcs.insert(rtcprr->senderSSRC());
-				for (int i = 0; i < rtcprr->header.reportCount(); ++i)
-					if (const auto *reportBlock = rtcprr->getReportBlock(i))
-						ssrcs.insert(reportBlock->getSSRC());
-			} else if (header->payloadType() == 202) {
-				auto sdes = reinterpret_cast<RtcpSdes *>(header);
-				if (!sdes->isValid()) {
-					PLOG_WARNING << "RTCP SDES packet is invalid";
-					continue;
+			case 201: // RR
+				if (length >= sizeof(RtcpRr)) {
+					auto rtcprr = reinterpret_cast<RtcpRr *>(header);
+					ssrcs.insert(rtcprr->senderSSRC());
+					for (int i = 0; i < rtcprr->header.reportCount(); ++i)
+						if (const auto *reportBlock = rtcprr->getReportBlock(i))
+							ssrcs.insert(reportBlock->getSSRC());
 				}
-				for (unsigned int i = 0; i < sdes->chunksCount(); i++) {
-					auto chunk = sdes->getChunk(i);
-					ssrcs.insert(chunk->ssrc());
+				break;
+
+			case 202: // SDES
+				if (length >= sizeof(RtcpSdes)) {
+					auto sdes = reinterpret_cast<RtcpSdes *>(header);
+					if (!sdes->isValid()) {
+						PLOG_WARNING << "RTCP SDES packet is invalid";
+						continue;
+					}
+					for (unsigned int i = 0; i < sdes->chunksCount(); i++) {
+						auto chunk = sdes->getChunk(i);
+						ssrcs.insert(chunk->ssrc());
+					}
 				}
-			} else {
+				break;
+
+
+			case 205: // FB
+			case 206:
+				if (length >= sizeof(RtcpFbHeader)) {
+					auto rtcpfb = reinterpret_cast<RtcpFbHeader *>(header);
+					ssrcs.insert(rtcpfb->packetSenderSSRC());
+					ssrcs.insert(rtcpfb->mediaSourceSSRC());
+					if (header->payloadType() == 206 && header->reportCount() == 15 &&
+						length >= sizeof(RtcpRemb)) {
+						auto remb = reinterpret_cast<RtcpRemb *>(header);
+						if (remb->hasValidId())
+							for (int i = 0; i < remb->getSSRCCount(); ++i)
+								ssrcs.insert(remb->getSSRC(i));
+					} else if (header->payloadType() == 206 && rtcpfb->header.reportCount() == 4 &&
+						length >= sizeof(RtcpFir)) {
+						// RFC 5104 FIR (PT=206, FMT=4): have variable number FCIs which is determined by
+						// overall rtcpfb length
+						auto fir = reinterpret_cast<const RtcpFir *>(header);
+						for (int i = 0; i < fir->getFciCount(); i++) {
+							if (const auto *fci = fir->getFci(i))
+								ssrcs.insert(fci->getSSRC());
+						}
+					}
+				}
+				break;
+
+			case 204: // APP
+				if (length >= RtcpApp::SizeWithData(0)) {
+					auto rtcpapp = reinterpret_cast<RtcpApp *>(header);
+					ssrcs.insert(rtcpapp->ssrc());
+				}
+				break;
+
+			default:
 				// PT=203 == Goodbye
-				// PT=204 == Application Specific
 				// PT=207 == Extended Report
-				if (header->payloadType() != 203 && header->payloadType() != 204 &&
+				if (header->payloadType() != 203 &&
 				    header->payloadType() != 207) {
 					COUNTER_UNKNOWN_PACKET_TYPE++;
 				}
+				break;
 			}
+			offset += header->lengthInBytes();
 		}
 
 		if (!ssrcs.empty()) {
@@ -669,7 +713,7 @@ shared_ptr<DataChannel> PeerConnection::emplaceDataChannel(string label, DataCha
 			throw std::invalid_argument("DataChannel stream id is too high");
 
 		channel->assignStream(stream);
-		mDataChannels.emplace(std::make_pair(stream, channel));
+		mDataChannels.emplace(stream, channel);
 
 	} else {
 		mUnassignedDataChannels.push_back(channel);
@@ -737,7 +781,7 @@ void PeerConnection::assignDataChannels() {
 		PLOG_DEBUG << "Assigning stream " << stream << " to DataChannel";
 
 		channel->assignStream(stream);
-		mDataChannels.emplace(std::make_pair(stream, channel));
+		mDataChannels.emplace(stream, channel);
 	}
 
 	mUnassignedDataChannels.clear();
@@ -799,7 +843,7 @@ shared_ptr<Track> PeerConnection::emplaceTrack(Description::Media description) {
 		track->setDescription(std::move(description));
 	} else {
 		track = std::make_shared<Track>(weak_from_this(), std::move(description));
-		mTracks.emplace(std::make_pair(track->mid(), track));
+		mTracks.emplace(track->mid(), track);
 		mTrackLines.emplace_back(track);
 	}
 
@@ -1090,8 +1134,17 @@ void PeerConnection::processRemoteDescription(Description description) {
 		if (std::holds_alternative<Description::Media *>(media)) {
 			auto remoteMedia = std::get<Description::Media *>(media);
 			std::unique_lock lock(mTracksMutex); // we may emplace a track
-			if (auto it = mTracks.find(remoteMedia->mid()); it != mTracks.end())
+			if (auto it = mTracks.find(remoteMedia->mid()); it != mTracks.end()) {
+				// Existing track — negotiate RTX with remote description
+				if (auto track = it->second.lock()) {
+					auto desc = track->description();
+					if (desc.isRtxEnabled() && !remoteMedia->isRtxEnabled()) {
+						desc.disableRtx();
+						track->setDescription(std::move(desc));
+					}
+				}
 				continue;
+			}
 
 			PLOG_DEBUG << "New remote track, mid=\"" << remoteMedia->mid() << "\"";
 
@@ -1106,7 +1159,7 @@ void PeerConnection::processRemoteDescription(Description description) {
 
 			// Create incoming track
 			auto track = std::make_shared<Track>(weak_from_this(), std::move(reciprocated));
-			mTracks.emplace(std::make_pair(track->mid(), track));
+			mTracks.emplace(track->mid(), track);
 			mTrackLines.emplace_back(track);
 			triggerTrack(track); // The user may modify the track description
 
@@ -1135,6 +1188,14 @@ void PeerConnection::processRemoteDescription(Description description) {
 	}
 
 	auto dtlsTransport = std::atomic_load(&mDtlsTransport);
+	if (!dtlsTransport) {
+		// ICE might have connected before the remote fingerprint was committed.
+		auto iceTransport = std::atomic_load(&mIceTransport);
+		if (iceTransport && (iceTransport->state() == Transport::State::Connected ||
+		                     iceTransport->state() == Transport::State::Completed))
+			dtlsTransport = initDtlsTransport();
+	}
+
 	if (description.hasApplication()) {
 		auto sctpTransport = std::atomic_load(&mSctpTransport);
 		if (!sctpTransport && dtlsTransport &&
@@ -1315,6 +1376,7 @@ bool PeerConnection::changeState(State newState) {
 	} while (!state.compare_exchange_weak(current, newState));
 
 	std::ostringstream s;
+	s.imbue(std::locale::classic());
 	s << newState;
 	PLOG_INFO << "Changed state to " << s.str();
 
@@ -1333,6 +1395,7 @@ bool PeerConnection::changeIceState(IceState newState) {
 		return false;
 
 	std::ostringstream s;
+	s.imbue(std::locale::classic());
 	s << newState;
 	PLOG_INFO << "Changed ICE state to " << s.str();
 
@@ -1351,6 +1414,7 @@ bool PeerConnection::changeGatheringState(GatheringState newState) {
 		return false;
 
 	std::ostringstream s;
+	s.imbue(std::locale::classic());
 	s << newState;
 	PLOG_INFO << "Changed gathering state to " << s.str();
 	mProcessor.enqueue(&PeerConnection::trigger<GatheringState>, shared_from_this(),
@@ -1364,6 +1428,7 @@ bool PeerConnection::changeSignalingState(SignalingState newState) {
 		return false;
 
 	std::ostringstream s;
+	s.imbue(std::locale::classic());
 	s << newState;
 	PLOG_INFO << "Changed signaling state to " << s.str();
 	mProcessor.enqueue(&PeerConnection::trigger<SignalingState>, shared_from_this(),

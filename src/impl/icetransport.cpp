@@ -13,6 +13,7 @@
 #include "utils.hpp"
 
 #include <algorithm>
+#include <future>
 #include <iostream>
 #include <random>
 #include <sstream>
@@ -250,7 +251,7 @@ void IceTransport::gatherLocalCandidates(string mid, std::vector<IceServer> addi
 
 optional<string> IceTransport::getLocalAddress() const {
 	char str[JUICE_MAX_ADDRESS_STRING_LEN];
-	if (juice_get_selected_addresses(mAgent.get(), str, JUICE_MAX_ADDRESS_STRING_LEN, NULL, 0) ==
+	if (juice_get_selected_addresses(mAgent.get(), str, JUICE_MAX_ADDRESS_STRING_LEN, nullptr, 0) ==
 	    0) {
 		return std::make_optional(string(str));
 	}
@@ -258,7 +259,7 @@ optional<string> IceTransport::getLocalAddress() const {
 }
 optional<string> IceTransport::getRemoteAddress() const {
 	char str[JUICE_MAX_ADDRESS_STRING_LEN];
-	if (juice_get_selected_addresses(mAgent.get(), NULL, 0, str, JUICE_MAX_ADDRESS_STRING_LEN) ==
+	if (juice_get_selected_addresses(mAgent.get(), nullptr, 0, str, JUICE_MAX_ADDRESS_STRING_LEN) ==
 	    0) {
 		return std::make_optional(string(str));
 	}
@@ -289,7 +290,7 @@ bool IceTransport::send(message_ptr message) {
 		return false;
 
 	PLOG_VERBOSE << "Send size=" << message->size();
-	return outgoing(message);
+	return outgoing(std::move(message));
 }
 
 bool IceTransport::outgoing(message_ptr message) {
@@ -666,7 +667,32 @@ IceTransport::~IceTransport() {
 	nice_agent_attach_recv(mNiceAgent.get(), mStreamId, 1, g_main_loop_get_context(MainLoop->get()),
 	                       NULL, NULL);
 
-	nice_agent_remove_stream(mNiceAgent.get(), mStreamId);
+	// Remove the stream on the main loop thread. The attach_recv above only
+	// clears the io callback: the socket sources stay attached, and libnice's
+	// component_io_cb dereferences its component before taking the agent lock,
+	// so removing the stream from here would free it under a live dispatch.
+	// GLib dispatches serially on that thread, so the removal cannot overlap
+	// one; waiting for it also ensures no callback still uses `this` or the
+	// stream's rx buffer.
+	{
+		struct RemoveStreamData {
+			NiceAgent *agent;
+			guint streamId;
+			std::promise<void> done;
+		} data{mNiceAgent.get(), mStreamId, {}};
+		auto future = data.done.get_future();
+		g_main_context_invoke_full(
+		    g_main_loop_get_context(MainLoop->get()), G_PRIORITY_HIGH,
+		    [](gpointer ptr) -> gboolean {
+			    auto *data = static_cast<RemoveStreamData *>(ptr);
+			    nice_agent_remove_stream(data->agent, data->streamId);
+			    data->done.set_value();
+			    return G_SOURCE_REMOVE;
+		    },
+		    &data, NULL);
+		future.wait();
+	}
+
 	mNiceAgent.reset();
 
 	if (mTimeoutId)
@@ -782,7 +808,7 @@ bool IceTransport::send(message_ptr message) {
 		return false;
 
 	PLOG_VERBOSE << "Send size=" << message->size();
-	return outgoing(message);
+	return outgoing(std::move(message));
 }
 
 bool IceTransport::outgoing(message_ptr message) {
@@ -851,6 +877,7 @@ string IceTransport::AddressToString(const NiceAddress &addr) {
 	nice_address_to_string(&addr, buffer);
 	unsigned int port = nice_address_get_port(&addr);
 	std::ostringstream ss;
+	ss.imbue(std::locale::classic());
 	ss << buffer << ":" << port;
 	return ss.str();
 }

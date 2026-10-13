@@ -13,10 +13,12 @@
 #if USE_GNUTLS
 
 #include <nettle/sha1.h>
+#include <nettle/version.h>
 
 #elif USE_MBEDTLS
 
-#include <mbedtls/sha1.h>
+#include "tls.hpp"
+#include <psa/crypto.h>
 
 #else
 
@@ -39,14 +41,22 @@ binary Sha1(const byte *data, size_t size) {
 	struct sha1_ctx ctx;
 	sha1_init(&ctx);
 	sha1_update(&ctx, size, reinterpret_cast<const uint8_t *>(data));
+#if NETTLE_VERSION_MAJOR >= 4
+	sha1_digest(&ctx, reinterpret_cast<uint8_t *>(output.data()));
+#else
 	sha1_digest(&ctx, SHA1_DIGEST_SIZE, reinterpret_cast<uint8_t *>(output.data()));
+#endif
 	return output;
 
 #elif USE_MBEDTLS
 
 	binary output(20);
-	mbedtls_sha1(reinterpret_cast<const unsigned char *>(data), size,
-	             reinterpret_cast<unsigned char *>(output.data()));
+	size_t hash_size = 0;
+	mbedtls::safe_psa([&] {
+		return psa_hash_compute(PSA_ALG_SHA_1, reinterpret_cast<const unsigned char *>(data),
+		             size, reinterpret_cast<unsigned char *>(output.data()), 20,
+		             &hash_size);
+	});
 	return output;
 
 #else

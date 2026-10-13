@@ -41,6 +41,7 @@ public:
 	void incoming(message_ptr message) override;
 
 	bool isClient() const { return mIsClient; }
+	optional<string> failureReason() const; // why the handshake failed, if it did
 
 private:
 	enum Opcode : uint8_t {
@@ -69,6 +70,7 @@ private:
 	bool sendFrame(const Frame &frame);
 
 	void addOutstandingPing();
+	void setFailureReason(string reason);
 
 	const shared_ptr<WsHandshake> mHandshake;
 	const bool mIsClient;
@@ -82,6 +84,8 @@ private:
 	std::mutex mSendMutex;
 	int mOutstandingPings = 0;
 	std::atomic<bool> mCloseSent = false;
+	optional<string> mFailureReason;
+	mutable std::mutex mFailureReasonMutex;
 };
 
 } // namespace rtc::impl

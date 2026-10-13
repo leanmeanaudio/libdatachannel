@@ -47,6 +47,7 @@ std::vector<string> explode(const string &str, char delim) {
 string implode(const std::vector<string> &tokens, char delim) {
 	string sdelim(1, delim);
 	std::ostringstream ss;
+	ss.imbue(std::locale::classic());
 	std::copy(tokens.begin(), tokens.end(), std::ostream_iterator<string>(ss, sdelim.c_str()));
 	string result = ss.str();
 	if (result.size() > 0)
@@ -137,7 +138,14 @@ std::seed_seq random_seed() {
 	seed.push_back(
 	    static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id())));
 
-	return std::seed_seq(seed.begin(), seed.end());
+	return {seed.begin(), seed.end()};
+}
+
+uint64_t ntp_time() {
+	const auto now = std::chrono::system_clock::now();
+	const double secs = std::chrono::duration<double>(now.time_since_epoch()).count();
+	// Assume the epoch is 01/01/1970 and adds the number of seconds between 1900 and 1970
+	return uint64_t(std::floor((secs + 2208988800.) * double(uint64_t(1) << 32)));
 }
 
 namespace {

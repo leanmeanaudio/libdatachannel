@@ -13,12 +13,15 @@
 #if RTC_ENABLE_MEDIA
 
 #include "common.hpp"
+#include "description.hpp"
 #include "mediahandler.hpp"
 #include "message.hpp"
 #include "rtp.hpp"
 
 #include <atomic>
 #include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #define RTP_SEQ_MOD (1<<16)
 
@@ -30,8 +33,9 @@ public:
 	RtcpReceivingSession() = default;
 	virtual ~RtcpReceivingSession() = default;
 
+	void media(const Description::Media &desc) override;
 	void incoming(message_vector &messages, const message_callback &send) override;
-	bool requestKeyframe(const message_callback &send) override;
+	bool requestKeyframe(const std::vector<SSRC>& targetSSRCs, bool retransmit, const message_callback &send) override;
 	bool requestBitrate(unsigned int bitrate, const message_callback &send) override;
 
 	// For backward compatibility
@@ -49,6 +53,7 @@ protected:
 	void pushREMB(const message_callback &send, unsigned int bitrate);
 	void pushRR(const message_callback &send,unsigned int lastSrDelay);
 	void pushPLI(const message_callback &send);
+	void pushFIR(const message_callback &send, const std::vector<SSRC>& targetSSRCs, bool retransmit);
 
 	void initSeq(uint16_t seq);
 	bool updateSeq(uint16_t seq);
@@ -70,6 +75,17 @@ protected:
 
 	std::atomic<unsigned int> mRequestedBitrate = 0;
 	std::mutex mSyncMutex;
+	std::mutex mMutex;
+
+	message_ptr unwrapRtx(const message_ptr &rtxPacket);
+
+	// RTX state populated by media() from SDP inspection
+	std::unordered_map<uint8_t, uint8_t> mRtxToPrimaryPtMap; // RTX PT -> primary PT
+	SSRC mRtxPrimarySsrc = 0;
+	bool mRtxEnabled = false;
+
+	bool mSupportsRfc5104Fir = false;
+	std::unordered_map<SSRC, uint32_t> mRfc5104FirCmdNums; // SSRC -> seq no mapping
 };
 
 } // namespace rtc

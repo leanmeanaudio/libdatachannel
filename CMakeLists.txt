@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
 project(libdatachannel
-	VERSION 0.24.2
+	VERSION 0.24.6
 	LANGUAGES CXX)
 set(PROJECT_DESCRIPTION "C/C++ WebRTC network library featuring Data Channels, Media Transport, and WebSockets")
 
@@ -106,6 +106,7 @@ set(LIBDATACHANNEL_SOURCES
 	${CMAKE_CURRENT_SOURCE_DIR}/src/plihandler.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/pacinghandler.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/rembhandler.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/src/rtcpapphandler.cpp
 )
 
 set(LIBDATACHANNEL_HEADERS
@@ -152,6 +153,7 @@ set(LIBDATACHANNEL_HEADERS
 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/plihandler.hpp
 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/pacinghandler.hpp
 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/rembhandler.hpp
+	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/rtcpapphandler.hpp
 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/version.h
 )
 
@@ -226,8 +228,11 @@ set(LIBDATACHANNEL_IMPL_HEADERS
 set(TESTS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/test/main.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test/connectivity.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/dtls.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test/negotiated.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test/reliability.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/test/simulcast_sdp_generation.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/test/simulcast_sdp_parsing.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test/turn_connectivity.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test/track.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test/video_layers_allocation.cpp
@@ -238,6 +243,12 @@ set(TESTS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/test/capi_websocketserver.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test/benchmark.cpp
 )
+
+if(NOT NO_MEDIA)
+    list(APPEND TESTS_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test/fir.cpp)
+    list(APPEND TESTS_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test/rtx.cpp)
+    list(APPEND TESTS_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test/rtcp_app.cpp)
+endif()
 
 set(TESTS_HEADERS 
 	${CMAKE_CURRENT_SOURCE_DIR}/test/test.hpp

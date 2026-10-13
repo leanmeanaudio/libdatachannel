@@ -82,12 +82,14 @@ init_token Init::token() {
 	return *mGlobal;
 }
 
-void Init::preload() {
+bool Init::preload() {
 	std::lock_guard lock(mMutex);
 	if (!mGlobal) {
 		mGlobal = std::make_shared<TokenPayload>(&mCleanupFuture);
 		mWeak = *mGlobal;
+		return true;
 	}
+	return false;
 }
 
 std::shared_future<void> Init::cleanup() {
@@ -110,7 +112,7 @@ void Init::setSctpSettings(SctpSettings s) {
 	mCurrentSctpSettings = std::move(s); // store for next init
 }
 
-void Init::doInit() {
+void Init::doInit() try {
 	// mMutex needs to be locked
 
 	if (std::exchange(mInitialized, true))
@@ -136,7 +138,7 @@ void Init::doInit() {
 #if USE_GNUTLS
 	// Nothing to do
 #elif USE_MBEDTLS
-	// Nothing to do
+	mbedtls::init();
 #else
 	openssl::init();
 #endif
@@ -151,6 +153,12 @@ void Init::doInit() {
 	DtlsSrtpTransport::Init();
 #endif
 	IceTransport::Init();
+} catch (...) {
+	PLOG_ERROR << "Global initialization failed, resetting";
+	ThreadPool::Instance().join();
+	ThreadPool::Instance().clear();
+	mInitialized = false;
+	throw;
 }
 
 void Init::doCleanup() {

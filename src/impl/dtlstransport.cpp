@@ -53,7 +53,7 @@ DtlsTransport::DtlsTransport(shared_ptr<IceTransport> lower, certificate_ptr cer
                              optional<size_t> mtu,
                              CertificateFingerprint::Algorithm fingerprintAlgorithm,
                              verifier_callback verifierCallback, state_callback stateChangeCallback)
-    : Transport(lower, std::move(stateChangeCallback)), mMtu(mtu), mCertificate(certificate),
+    : Transport(lower, std::move(stateChangeCallback)), mMtu(mtu), mCertificate(std::move(certificate)),
       mFingerprintAlgorithm(fingerprintAlgorithm), mVerifierCallback(std::move(verifierCallback)),
       mIsClient(lower->role() == Description::Role::Active),
       mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func) {
@@ -85,6 +85,8 @@ DtlsTransport::DtlsTransport(shared_ptr<IceTransport> lower, certificate_ptr cer
 		              "Failed to set SRTP profile");
 
 		gnutls::check(gnutls_credentials_set(mSession, GNUTLS_CRD_CERTIFICATE, creds));
+		if (!mIsClient)
+			gnutls_certificate_server_set_request(mSession, GNUTLS_CERT_REQUIRE);
 
 		gnutls_dtls_set_timeouts(mSession,
 		                         1000,   // 1s retransmission timeout recommended by RFC 6347
@@ -162,8 +164,11 @@ void DtlsTransport::incoming(message_ptr message) {
 	}
 
 	PLOG_VERBOSE << "Incoming size=" << message->size();
-	mIncomingQueue.push(message);
-	enqueueRecv();
+	if (mIncomingQueue.tryPush(std::move(message))) {
+		enqueueRecv();
+	} else {
+		PLOG_VERBOSE << "DTLS incoming queue is full, dropping";
+	}
 }
 
 bool DtlsTransport::outgoing(message_ptr message) {
@@ -381,7 +386,7 @@ DtlsTransport::DtlsTransport(shared_ptr<IceTransport> lower, certificate_ptr cer
                              optional<size_t> mtu,
                              CertificateFingerprint::Algorithm fingerprintAlgorithm,
                              verifier_callback verifierCallback, state_callback stateChangeCallback)
-    : Transport(lower, std::move(stateChangeCallback)), mMtu(mtu), mCertificate(certificate),
+    : Transport(lower, std::move(stateChangeCallback)), mMtu(mtu), mCertificate(std::move(certificate)),
       mFingerprintAlgorithm(fingerprintAlgorithm), mVerifierCallback(std::move(verifierCallback)),
       mIsClient(lower->role() == Description::Role::Active),
       mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func) {
@@ -391,23 +396,20 @@ DtlsTransport::DtlsTransport(shared_ptr<IceTransport> lower, certificate_ptr cer
 	if (!mCertificate)
 		throw std::invalid_argument("DTLS certificate is null");
 
-	mbedtls_entropy_init(&mEntropy);
-	mbedtls_ctr_drbg_init(&mDrbg);
 	mbedtls_ssl_init(&mSsl);
 	mbedtls_ssl_config_init(&mConf);
-	mbedtls_ctr_drbg_set_prediction_resistance(&mDrbg, MBEDTLS_CTR_DRBG_PR_ON);
 
 	try {
-		mbedtls::check(mbedtls_ctr_drbg_seed(&mDrbg, mbedtls_entropy_func, &mEntropy, NULL, 0));
-
 		mbedtls::check(mbedtls_ssl_config_defaults(
 		                   &mConf, mIsClient ? MBEDTLS_SSL_IS_CLIENT : MBEDTLS_SSL_IS_SERVER,
 		                   MBEDTLS_SSL_TRANSPORT_DATAGRAM, MBEDTLS_SSL_PRESET_DEFAULT));
 
-		mbedtls_ssl_conf_max_version(&mConf, MBEDTLS_SSL_MAJOR_VERSION_3, MBEDTLS_SSL_MINOR_VERSION_3); // TLS 1.2
+		mbedtls_ssl_conf_max_tls_version(&mConf, MBEDTLS_SSL_VERSION_TLS1_2);
 		mbedtls_ssl_conf_authmode(&mConf, MBEDTLS_SSL_VERIFY_OPTIONAL);
 		mbedtls_ssl_conf_verify(&mConf, DtlsTransport::CertificateCallback, this);
-		mbedtls_ssl_conf_rng(&mConf, mbedtls_ctr_drbg_random, &mDrbg);
+#if MBEDTLS_VERSION_MAJOR < 4
+		mbedtls_ssl_conf_rng(&mConf, mbedtls::random_func, nullptr);
+#endif
 
 		auto [crt, pk] = mCertificate->credentials();
 		mbedtls::check(mbedtls_ssl_conf_own_cert(&mConf, crt.get(), pk.get()));
@@ -422,8 +424,6 @@ DtlsTransport::DtlsTransport(shared_ptr<IceTransport> lower, certificate_ptr cer
 		mbedtls_ssl_set_timer_cb(&mSsl, this, SetTimerCallback, GetTimerCallback);
 
 	} catch (...) {
-		mbedtls_entropy_free(&mEntropy);
-		mbedtls_ctr_drbg_free(&mDrbg);
 		mbedtls_ssl_free(&mSsl);
 		mbedtls_ssl_config_free(&mConf);
 		throw;
@@ -438,8 +438,6 @@ DtlsTransport::~DtlsTransport() {
 	stop();
 
 	PLOG_DEBUG << "Destroying DTLS transport";
-	mbedtls_entropy_free(&mEntropy);
-	mbedtls_ctr_drbg_free(&mDrbg);
 	mbedtls_ssl_free(&mSsl);
 	mbedtls_ssl_config_free(&mConf);
 }
@@ -501,8 +499,11 @@ void DtlsTransport::incoming(message_ptr message) {
 	}
 
 	PLOG_VERBOSE << "Incoming size=" << message->size();
-	mIncomingQueue.push(message);
-	enqueueRecv();
+	if (mIncomingQueue.tryPush(std::move(message))) {
+		enqueueRecv();
+	} else {
+		PLOG_VERBOSE << "DTLS incoming queue is full, dropping";
+	}
 }
 
 bool DtlsTransport::outgoing(message_ptr message) {
@@ -543,7 +544,9 @@ void DtlsTransport::doRecv() {
 				}
 
 				if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
-					ThreadPool::Instance().schedule(mTimerSetAt + milliseconds(mFinMs),
+					auto timeout = mFinMs != 0 ? mTimerSetAt + milliseconds(mFinMs)
+					                           : std::chrono::steady_clock::now() + milliseconds(MBEDTLS_SSL_DTLS_TIMEOUT_DFL_MIN);
+					ThreadPool::Instance().schedule(timeout,
 					                                [weak_this = weak_from_this()]() {
 						                                if (auto locked = weak_this.lock())
 							                                locked->doRecv();
@@ -610,12 +613,18 @@ void DtlsTransport::doRecv() {
 }
 
 int DtlsTransport::CertificateCallback(void *ctx, mbedtls_x509_crt *crt, int /*depth*/,
-                                       uint32_t * /*flags*/) {
+                                       uint32_t *flags) {
 	auto this_ = static_cast<DtlsTransport *>(ctx);
 	string fingerprint = make_fingerprint(crt, this_->mFingerprintAlgorithm);
 	std::transform(fingerprint.begin(), fingerprint.end(), fingerprint.begin(),
 	               [](char c) { return char(std::toupper(c)); });
-	return this_->mVerifierCallback(fingerprint) ? 0 : 1;
+
+	if (!this_->mVerifierCallback(fingerprint)) {
+		if (flags) *flags |= MBEDTLS_X509_BADCERT_NOT_TRUSTED;
+		return MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
+	}
+
+	return 0;
 }
 
 void DtlsTransport::ExportKeysCallback(void *ctx, mbedtls_ssl_key_export_type /*type*/,
@@ -660,7 +669,7 @@ int DtlsTransport::ReadCallback(void *ctx, unsigned char *buf, size_t len) {
 
 			auto bufMin = std::min(len, size_t(message->size()));
 			std::memcpy(buf, message->data(), bufMin);
-			return int(len);
+			return int(bufMin);
 		}
 
 		// Closed
@@ -700,7 +709,7 @@ int DtlsTransport::GetTimerCallback(void *ctx) {
 
 #else // OPENSSL
 
-BIO_METHOD *DtlsTransport::BioMethods = NULL;
+BIO_METHOD *DtlsTransport::BioMethods = nullptr;
 int DtlsTransport::TransportExIndex = -1;
 std::mutex DtlsTransport::GlobalMutex;
 
@@ -719,7 +728,7 @@ void DtlsTransport::Init() {
 		BIO_meth_set_ctrl(BioMethods, BioMethodCtrl);
 	}
 	if (TransportExIndex < 0) {
-		TransportExIndex = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+		TransportExIndex = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
 	}
 }
 
@@ -731,7 +740,7 @@ DtlsTransport::DtlsTransport(shared_ptr<IceTransport> lower, certificate_ptr cer
                              optional<size_t> mtu,
                              CertificateFingerprint::Algorithm fingerprintAlgorithm,
                              verifier_callback verifierCallback, state_callback stateChangeCallback)
-    : Transport(lower, std::move(stateChangeCallback)), mMtu(mtu), mCertificate(certificate),
+    : Transport(lower, std::move(stateChangeCallback)), mMtu(mtu), mCertificate(std::move(certificate)),
       mFingerprintAlgorithm(fingerprintAlgorithm), mVerifierCallback(std::move(verifierCallback)),
       mIsClient(lower->role() == Description::Role::Active),
       mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func) {
@@ -856,9 +865,15 @@ void DtlsTransport::start() {
 		err = SSL_get_error(mSsl, ret);
 	}
 
-	openssl::check_error(err, "Handshake failed");
+	openssl::check_error(err, "Handshake failed", mSsl);
 
-	handleTimeout();
+	// start() can run on the libjuice poll thread via the ICE state-change
+	// callback, while juice still holds its registry mutex. Calling
+	// handleTimeout() inline then waits on mSslMutex, which a thread pool
+	// recv thread may hold while blocked in juice_send (conn_lock) on the
+	// TURN relay path, forming an ABBA deadlock. Defer the initial timeout
+	// handling to the thread pool, as the other TLS backends do.
+	enqueueRecv(); // to initiate the handshake
 }
 
 void DtlsTransport::stop() {
@@ -896,8 +911,11 @@ void DtlsTransport::incoming(message_ptr message) {
 	}
 
 	PLOG_VERBOSE << "Incoming size=" << message->size();
-	mIncomingQueue.push(message);
-	enqueueRecv();
+	if (mIncomingQueue.tryPush(std::move(message))) {
+		enqueueRecv();
+	} else {
+		PLOG_VERBOSE << "DTLS incoming queue is full, dropping";
+	}
 }
 
 bool DtlsTransport::outgoing(message_ptr message) {
@@ -943,18 +961,19 @@ void DtlsTransport::doRecv() {
 			if (demuxMessage(message))
 				continue;
 
-			BIO_write(mInBio, message->data(), int(message->size()));
-
+			bool incomingWritten = false;
 			if (state() == State::Connecting) {
 				// Continue the handshake
 				int ret, err;
 				{
 					std::lock_guard lock(mSslMutex);
+					BIO_write(mInBio, message->data(), int(message->size()));
+					incomingWritten = true;
 					ret = SSL_do_handshake(mSsl);
 					err = SSL_get_error(mSsl, ret);
 				}
 
-				if (openssl::check_error(err, "Handshake failed")) {
+				if (openssl::check_error(err, "Handshake failed", mSsl)) {
 					// RFC 8261: DTLS MUST support sending messages larger than the current path MTU
 					// See https://www.rfc-editor.org/rfc/rfc8261.html#section-5
 					{
@@ -972,6 +991,8 @@ void DtlsTransport::doRecv() {
 				int ret, err;
 				{
 					std::lock_guard lock(mSslMutex);
+					if (!incomingWritten)
+						BIO_write(mInBio, message->data(), int(message->size()));
 					ret = SSL_read(mSsl, buffer, bufferSize);
 					err = SSL_get_error(mSsl, ret);
 				}
@@ -1035,7 +1056,7 @@ void DtlsTransport::handleTimeout() {
 int DtlsTransport::CertificateCallback(int /*preverify_ok*/, X509_STORE_CTX *ctx) {
 	SSL *ssl =
 	    static_cast<SSL *>(X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx()));
-	DtlsTransport *t =
+	auto *t =
 	    static_cast<DtlsTransport *>(SSL_get_ex_data(ssl, DtlsTransport::TransportExIndex));
 
 	X509 *crt = X509_STORE_CTX_get_current_cert(ctx);
@@ -1045,7 +1066,7 @@ int DtlsTransport::CertificateCallback(int /*preverify_ok*/, X509_STORE_CTX *ctx
 }
 
 void DtlsTransport::InfoCallback(const SSL *ssl, int where, int ret) {
-	DtlsTransport *t =
+	auto *t =
 	    static_cast<DtlsTransport *>(SSL_get_ex_data(ssl, DtlsTransport::TransportExIndex));
 
 	if (where & SSL_CB_ALERT) {
@@ -1058,7 +1079,7 @@ void DtlsTransport::InfoCallback(const SSL *ssl, int where, int ret) {
 
 int DtlsTransport::BioMethodNew(BIO *bio) {
 	BIO_set_init(bio, 1);
-	BIO_set_data(bio, NULL);
+	BIO_set_data(bio, nullptr);
 	BIO_set_shutdown(bio, 0);
 	return 1;
 }
@@ -1066,7 +1087,7 @@ int DtlsTransport::BioMethodNew(BIO *bio) {
 int DtlsTransport::BioMethodFree(BIO *bio) {
 	if (!bio)
 		return 0;
-	BIO_set_data(bio, NULL);
+	BIO_set_data(bio, nullptr);
 	return 1;
 }
 
