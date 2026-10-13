@@ -444,13 +444,10 @@ shared_ptr<WsTransport> WebSocket::initWsTransport() {
 								triggerOpen();
 						}
 						break;
-					case State::Failed: {
-						auto transport = getWsTransport();
-						auto reason = transport ? transport->failureReason() : nullopt;
-						triggerError(reason ? *reason : "WebSocket connection failed");
+					case State::Failed:
+						triggerError("WebSocket connection failed");
 						remoteClose();
 						break;
-					}
 					case State::Disconnected:
 						remoteClose();
 						break;

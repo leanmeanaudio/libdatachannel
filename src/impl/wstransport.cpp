@@ -171,7 +171,6 @@ void WsTransport::incoming(message_ptr message) {
 
 		} catch (const WsHandshake::RequestError &e) {
 			PLOG_WARNING << e.what();
-			setFailureReason(e.what());
 			try {
 				sendHttpError(e.responseCode());
 
@@ -181,11 +180,9 @@ void WsTransport::incoming(message_ptr message) {
 
 		} catch (const WsHandshake::Error &e) {
 			PLOG_WARNING << e.what();
-			setFailureReason(e.what());
 
 		} catch (const std::exception &e) {
 			PLOG_ERROR << e.what();
-			setFailureReason(e.what());
 		}
 	}
 
@@ -197,16 +194,6 @@ void WsTransport::incoming(message_ptr message) {
 		PLOG_ERROR << "WebSocket handshake failed";
 		changeState(State::Failed);
 	}
-}
-
-optional<string> WsTransport::failureReason() const {
-	std::lock_guard lock(mFailureReasonMutex);
-	return mFailureReason;
-}
-
-void WsTransport::setFailureReason(string reason) {
-	std::lock_guard lock(mFailureReasonMutex);
-	mFailureReason = std::move(reason);
 }
 
 bool WsTransport::sendHttpRequest() {
